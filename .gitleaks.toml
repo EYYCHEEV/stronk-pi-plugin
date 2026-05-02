@@ -1,0 +1,8 @@
+title = "stronk-pi gitleaks config"
+
+[allowlist]
+description = "Allow placeholder examples only."
+regexes = [
+  '''<redacted>''',
+  '''FAKE_[A-Z0-9_]+''',
+]

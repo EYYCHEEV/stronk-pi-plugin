@@ -1,0 +1,16 @@
+{
+  "name": "stronk-pi",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "description": "Private Pi Coding Agent safety extension for the agentic workstation.",
+  "main": "src/index.mjs",
+  "scripts": {
+    "test": "node --test",
+    "lint:security": "node scripts/security-check.mjs",
+    "check": "npm run test && npm run lint:security"
+  },
+  "engines": {
+    "node": ">=20.6.0"
+  }
+}
