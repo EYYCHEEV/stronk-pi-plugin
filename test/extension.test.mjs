@@ -180,6 +180,32 @@ test('managed plugin tools are allowed after helper approval', async () => {
   });
 });
 
+test('nested managed plugin payload mutation blocks tool_call', async () => {
+  const script = tempScript(`#!/usr/bin/env node
+process.stdin.resume();
+setTimeout(() => console.log(JSON.stringify({ allow: true, reason: 'ok' })), 50);
+`);
+  await withEnv({ STRONK_PI_HOOK_COMMAND_JSON: JSON.stringify([script]) }, async () => {
+    const event = {
+      toolName: 'mcp',
+      input: {
+        tool: 'mock_echo',
+        args: {
+          command: 'printf safe',
+          nested: { server: 'mock' },
+        },
+      },
+      cwd: process.cwd(),
+    };
+    const pending = internals.handleToolCall(event);
+    event.input.args.command = 'sudo whoami';
+    event.input.args.nested.server = 'unsafe';
+    const result = await pending;
+    assert.equal(result.block, true);
+    assert.match(result.reason, /mutated/);
+  });
+});
+
 test('user_bash denial returns a failed synthetic result', async () => {
   await withEnv({ STRONK_PI_HOOK_COMMAND_JSON: JSON.stringify([denyScript()]) }, async () => {
     const result = await internals.handleUserBash({

@@ -14,7 +14,19 @@ const SECRET_VALUE_PATTERNS = [
 ];
 
 function canonical(value) {
-  return JSON.stringify(value, Object.keys(value ?? {}).sort());
+  return JSON.stringify(stableJson(value));
+}
+
+function stableJson(value) {
+  if (Array.isArray(value)) return value.map(stableJson);
+  if (value && typeof value === 'object') {
+    const out = {};
+    for (const key of Object.keys(value).sort()) {
+      out[key] = stableJson(value[key]);
+    }
+    return out;
+  }
+  return value;
 }
 
 function redact(value) {
