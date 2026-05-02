@@ -29,6 +29,18 @@ function stableJson(value) {
   return value;
 }
 
+function hasSensitiveContent(value) {
+  if (Array.isArray(value)) return value.some(hasSensitiveContent);
+  if (value && typeof value === 'object') {
+    return Object.entries(value).some(([key, item]) => SECRET_KEY_PATTERN.test(key) || hasSensitiveContent(item));
+  }
+  if (typeof value !== 'string') return false;
+  return SECRET_VALUE_PATTERNS.some((pattern) => {
+    pattern.lastIndex = 0;
+    return pattern.test(value);
+  });
+}
+
 function redact(value) {
   if (Array.isArray(value)) return value.map(redact);
   if (value && typeof value === 'object') {
@@ -139,6 +151,7 @@ async function handleToolCall(event) {
   const toolName = event?.toolName;
   if (!toolName) return block('tool_call missing toolName');
   if (isUnsupportedMutatingTool(toolName)) return block(`unsupported mutating tool denied: ${toolName}`);
+  if (hasSensitiveContent(event.input ?? {})) return block('sensitive content blocked in tool_call input');
 
   const before = canonical(event.input ?? {});
   let decision;
@@ -167,6 +180,7 @@ async function handleToolCall(event) {
 
 async function handleUserBash(event) {
   const before = String(event?.command ?? '');
+  if (hasSensitiveContent(before)) return deniedBashResult('sensitive content blocked in user_bash command');
   let decision;
   try {
     decision = await guardedDecision({
@@ -205,6 +219,7 @@ export default async function stronkPi(pi) {
 
 export const internals = {
   canonical,
+  hasSensitiveContent,
   redact,
   helperArgv,
   runHelper,

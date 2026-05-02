@@ -1,4 +1,4 @@
-import { mkdtempSync, writeFileSync, chmodSync, readFileSync } from 'node:fs';
+import { mkdtempSync, writeFileSync, chmodSync, readFileSync, existsSync } from 'node:fs';
 import { join } from 'node:path';
 import { tmpdir } from 'node:os';
 import test from 'node:test';
@@ -206,6 +206,50 @@ setTimeout(() => console.log(JSON.stringify({ allow: true, reason: 'ok' })), 50)
   });
 });
 
+test('secret-like managed plugin args block before helper execution', async () => {
+  const dir = mkdtempSync(join(tmpdir(), 'stronk-pi-secret-block.'));
+  const capture = join(dir, 'capture.json');
+  const fakeSecret = `sk-${'abcdefghijklmnopqrstuvwxyz'}`;
+  const script = tempScript(`#!/usr/bin/env node
+import { writeFileSync } from 'node:fs';
+let input = '';
+process.stdin.on('data', (chunk) => input += chunk);
+process.stdin.on('end', () => {
+  writeFileSync(${JSON.stringify(capture)}, input);
+  console.log(JSON.stringify({ allow: true, reason: 'ok' }));
+});
+`);
+  await withEnv({ STRONK_PI_HOOK_COMMAND_JSON: JSON.stringify([script]) }, async () => {
+    const result = await internals.handleToolCall({
+      toolName: 'mcp',
+      input: {
+        tool: 'mock_echo',
+        args: {
+          command: 'printf safe',
+          token: fakeSecret,
+        },
+      },
+      cwd: process.cwd(),
+    });
+    assert.equal(result.block, true);
+    assert.match(result.reason, /sensitive content/);
+  });
+  assert.equal(existsSync(capture), false);
+});
+
+test('secret-like user_bash command returns a failed synthetic result', async () => {
+  const fakeSecret = `sk-${'abcdefghijklmnopqrstuvwxyz'}`;
+  await withEnv({ STRONK_PI_HOOK_COMMAND_JSON: JSON.stringify([allowScript()]) }, async () => {
+    const result = await internals.handleUserBash({
+      command: `printf ${fakeSecret}`,
+      cwd: process.cwd(),
+      excludeFromContext: false,
+    });
+    assert.equal(result.result.exitCode, 1);
+    assert.match(result.result.output, /sensitive content/);
+  });
+});
+
 test('user_bash denial returns a failed synthetic result', async () => {
   await withEnv({ STRONK_PI_HOOK_COMMAND_JSON: JSON.stringify([denyScript()]) }, async () => {
     const result = await internals.handleUserBash({
@@ -224,7 +268,7 @@ test('telegram helper failure is fail-open', async () => {
   });
 });
 
-test('redacts secrets before helper stdin', async () => {
+test('redacts telegram secrets before helper stdin', async () => {
   const dir = mkdtempSync(join(tmpdir(), 'stronk-pi-redact.'));
   const capture = join(dir, 'capture.json');
   const fakeSecret = `sk-${'abcdefghijklmnopqrstuvwxyz'}`;
@@ -237,11 +281,13 @@ process.stdin.on('end', () => {
   console.log(JSON.stringify({ allow: true, reason: 'ok' }));
 });
 `);
-  await withEnv({ STRONK_PI_HOOK_COMMAND_JSON: JSON.stringify([script]) }, async () => {
-    await internals.handleToolCall({
-      toolName: 'bash',
-      input: { command: `printf ${fakeSecret}` },
-      cwd: process.cwd(),
+  await withEnv({ STRONK_PI_TELEGRAM_COMMAND_JSON: JSON.stringify([script]) }, async () => {
+    await internals.notify({
+      type: 'tool_result',
+      event: {
+        token: fakeSecret,
+        output: `printf ${fakeSecret}`,
+      },
     });
   });
   const captured = readFileSync(capture, 'utf8');
