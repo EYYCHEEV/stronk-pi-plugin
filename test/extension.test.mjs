@@ -251,10 +251,12 @@ process.stdin.on('end', () => {
 `);
   const cases = [
     ['mcp', { tool: 'mock_echo', args: { apiKey: 'plain-demo-value' } }],
+    ['mcp', { tool: 'mock_echo', args: { secretKey: 'plain-demo-value' } }],
     ['subagent', { action: 'run', input: { accessToken: 'plain-demo-value' } }],
-    ['bash', { command: 'API_KEY=plain-demo-value some-tool' }],
-    ['write', { path: 'notes.txt', content: 'clientSecret=plain-demo-value' }],
-    ['edit', { path: 'notes.txt', edits: [{ oldText: 'x', newText: 'ACCESS_TOKEN=plain-demo-value' }] }],
+    ['subagent', { action: 'run', input: { privateKey: 'plain-demo-value' } }],
+    ['bash', { command: 'OPENAI_API_KEY=plain-demo-value some-tool' }],
+    ['write', { path: 'notes.txt', content: 'MY_CLIENT_SECRET=plain-demo-value' }],
+    ['edit', { path: 'notes.txt', edits: [{ oldText: 'x', newText: 'MY_ACCESS_TOKEN=plain-demo-value' }] }],
   ];
   await withEnv({ STRONK_PI_HOOK_COMMAND_JSON: JSON.stringify([script]) }, async () => {
     for (const [toolName, input] of cases) {
@@ -282,7 +284,7 @@ test('secret-like user_bash command returns a failed synthetic result', async ()
 test('inline secret assignment in user_bash returns a failed synthetic result', async () => {
   await withEnv({ STRONK_PI_HOOK_COMMAND_JSON: JSON.stringify([allowScript()]) }, async () => {
     const result = await internals.handleUserBash({
-      command: 'CLIENT_SECRET=plain-demo-value some-tool',
+      command: 'OPENAI_API_KEY=plain-demo-value some-tool',
       cwd: process.cwd(),
       excludeFromContext: false,
     });
@@ -328,8 +330,9 @@ process.stdin.on('end', () => {
       event: {
         token: fakeSecret,
         apiKey: 'plain-demo-value',
+        privateKey: 'plain-demo-value',
         output: `printf ${fakeSecret}`,
-        command: 'CLIENT_SECRET=plain-demo-value some-tool',
+        command: 'MY_CLIENT_SECRET=plain-demo-value some-tool',
       },
     });
   });

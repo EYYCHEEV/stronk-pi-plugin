@@ -15,6 +15,7 @@ const SECRET_KEY_SUFFIXES = [
   'credentials',
   'cookie',
   'privatekey',
+  'secretkey',
 ];
 const SECRET_VALUE_PATTERNS = [
   /sk-[A-Za-z0-9_-]{16,}/g,
@@ -25,9 +26,7 @@ const SECRET_VALUE_PATTERNS = [
   /\bBearer\s+[A-Za-z0-9._~+/=-]{16,}/g,
   /-----BEGIN [A-Z ]*PRIVATE KEY-----/g,
 ];
-const SECRET_ASSIGNMENT_PATTERNS = [
-  /\b(api[_-]?key|access[_-]?token|refresh[_-]?token|auth[_-]?token|bearer[_-]?token|client[_-]?secret|secret[_-]?key|private[_-]?key|password|passphrase|credential|cookie)\b\s*[:=]\s*["']?[^"'\s;]{4,}/gi,
-];
+const ASSIGNMENT_PATTERN = /(^|[\s;])([A-Za-z_][A-Za-z0-9_-]*)\s*([:=])\s*["']?([^"'\s;]{4,})/g;
 
 function canonical(value) {
   return JSON.stringify(stableJson(value));
@@ -63,7 +62,12 @@ function matchesPattern(pattern, text) {
 }
 
 function hasSensitiveString(text) {
-  return [...SECRET_VALUE_PATTERNS, ...SECRET_ASSIGNMENT_PATTERNS].some((pattern) => matchesPattern(pattern, text));
+  if (SECRET_VALUE_PATTERNS.some((pattern) => matchesPattern(pattern, text))) return true;
+  ASSIGNMENT_PATTERN.lastIndex = 0;
+  for (let match = ASSIGNMENT_PATTERN.exec(text); match; match = ASSIGNMENT_PATTERN.exec(text)) {
+    if (isSensitiveKey(match[2])) return true;
+  }
+  return false;
 }
 
 function hasSensitiveContent(value) {
@@ -86,9 +90,12 @@ function redact(value) {
   }
   if (typeof value !== 'string') return value;
   let text = value;
-  for (const pattern of [...SECRET_VALUE_PATTERNS, ...SECRET_ASSIGNMENT_PATTERNS]) {
+  for (const pattern of SECRET_VALUE_PATTERNS) {
     text = text.replace(pattern, '<redacted>');
   }
+  text = text.replace(ASSIGNMENT_PATTERN, (match, prefix, key, operator) => (
+    isSensitiveKey(key) ? `${prefix}${key}${operator}<redacted>` : match
+  ));
   return text.length > 2000 ? `${text.slice(0, 2000)}...<truncated>` : text;
 }
 
