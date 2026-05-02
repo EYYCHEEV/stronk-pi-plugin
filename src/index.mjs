@@ -3,6 +3,7 @@ import { accessSync, constants } from 'node:fs';
 
 const READ_ONLY_TOOLS = new Set(['read', 'grep', 'find', 'ls']);
 const MUTATING_TOOLS = new Set(['bash', 'write', 'edit', 'patch', 'apply_patch', 'multi_edit']);
+const PLUGIN_TOOLS = new Set(['mcp', 'subagent']);
 const SECRET_KEY_PATTERN = /(^|_)(API_KEY|KEY|TOKEN|SECRET|PASSWORD|PASS|CREDENTIAL|COOKIE)($|_)/i;
 const SECRET_VALUE_PATTERNS = [
   /sk-[A-Za-z0-9_-]{16,}/g,
@@ -146,7 +147,7 @@ async function handleToolCall(event) {
     return block('tool_call payload mutated during guard evaluation');
   }
   if (!decision.allow) return block(decision.reason);
-  if (!READ_ONLY_TOOLS.has(toolName) && !MUTATING_TOOLS.has(toolName)) {
+  if (!READ_ONLY_TOOLS.has(toolName) && !MUTATING_TOOLS.has(toolName) && !PLUGIN_TOOLS.has(toolName)) {
     return block(`unknown tool denied by default: ${toolName}`);
   }
   return undefined;

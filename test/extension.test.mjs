@@ -163,6 +163,23 @@ test('unknown mutating tool is denied before helper execution', async () => {
   });
 });
 
+test('managed plugin tools are allowed after helper approval', async () => {
+  await withEnv({ STRONK_PI_HOOK_COMMAND_JSON: JSON.stringify([allowScript()]) }, async () => {
+    const mcp = await internals.handleToolCall({
+      toolName: 'mcp',
+      input: { search: 'docs' },
+      cwd: process.cwd(),
+    });
+    const subagent = await internals.handleToolCall({
+      toolName: 'subagent',
+      input: { action: 'list' },
+      cwd: process.cwd(),
+    });
+    assert.equal(mcp, undefined);
+    assert.equal(subagent, undefined);
+  });
+});
+
 test('user_bash denial returns a failed synthetic result', async () => {
   await withEnv({ STRONK_PI_HOOK_COMMAND_JSON: JSON.stringify([denyScript()]) }, async () => {
     const result = await internals.handleUserBash({
