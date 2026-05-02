@@ -237,11 +237,52 @@ process.stdin.on('end', () => {
   assert.equal(existsSync(capture), false);
 });
 
+test('camelCase sensitive keys and inline assignments block before helper execution', async () => {
+  const dir = mkdtempSync(join(tmpdir(), 'stronk-pi-sensitive-block.'));
+  const capture = join(dir, 'capture.json');
+  const script = tempScript(`#!/usr/bin/env node
+import { writeFileSync } from 'node:fs';
+let input = '';
+process.stdin.on('data', (chunk) => input += chunk);
+process.stdin.on('end', () => {
+  writeFileSync(${JSON.stringify(capture)}, input);
+  console.log(JSON.stringify({ allow: true, reason: 'ok' }));
+});
+`);
+  const cases = [
+    ['mcp', { tool: 'mock_echo', args: { apiKey: 'plain-demo-value' } }],
+    ['subagent', { action: 'run', input: { accessToken: 'plain-demo-value' } }],
+    ['bash', { command: 'API_KEY=plain-demo-value some-tool' }],
+    ['write', { path: 'notes.txt', content: 'clientSecret=plain-demo-value' }],
+    ['edit', { path: 'notes.txt', edits: [{ oldText: 'x', newText: 'ACCESS_TOKEN=plain-demo-value' }] }],
+  ];
+  await withEnv({ STRONK_PI_HOOK_COMMAND_JSON: JSON.stringify([script]) }, async () => {
+    for (const [toolName, input] of cases) {
+      const result = await internals.handleToolCall({ toolName, input, cwd: process.cwd() });
+      assert.equal(result.block, true);
+      assert.match(result.reason, /sensitive content/);
+    }
+  });
+  assert.equal(existsSync(capture), false);
+});
+
 test('secret-like user_bash command returns a failed synthetic result', async () => {
   const fakeSecret = `sk-${'abcdefghijklmnopqrstuvwxyz'}`;
   await withEnv({ STRONK_PI_HOOK_COMMAND_JSON: JSON.stringify([allowScript()]) }, async () => {
     const result = await internals.handleUserBash({
       command: `printf ${fakeSecret}`,
+      cwd: process.cwd(),
+      excludeFromContext: false,
+    });
+    assert.equal(result.result.exitCode, 1);
+    assert.match(result.result.output, /sensitive content/);
+  });
+});
+
+test('inline secret assignment in user_bash returns a failed synthetic result', async () => {
+  await withEnv({ STRONK_PI_HOOK_COMMAND_JSON: JSON.stringify([allowScript()]) }, async () => {
+    const result = await internals.handleUserBash({
+      command: 'CLIENT_SECRET=plain-demo-value some-tool',
       cwd: process.cwd(),
       excludeFromContext: false,
     });
@@ -286,11 +327,14 @@ process.stdin.on('end', () => {
       type: 'tool_result',
       event: {
         token: fakeSecret,
+        apiKey: 'plain-demo-value',
         output: `printf ${fakeSecret}`,
+        command: 'CLIENT_SECRET=plain-demo-value some-tool',
       },
     });
   });
   const captured = readFileSync(capture, 'utf8');
   assert.doesNotMatch(captured, new RegExp(fakeSecret));
+  assert.doesNotMatch(captured, /plain-demo-value/);
   assert.match(captured, /<redacted>/);
 });

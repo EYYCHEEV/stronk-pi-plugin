@@ -4,13 +4,29 @@ import { accessSync, constants } from 'node:fs';
 const READ_ONLY_TOOLS = new Set(['read', 'grep', 'find', 'ls']);
 const MUTATING_TOOLS = new Set(['bash', 'write', 'edit', 'patch', 'apply_patch', 'multi_edit']);
 const PLUGIN_TOOLS = new Set(['mcp', 'subagent']);
-const SECRET_KEY_PATTERN = /(^|_)(API_KEY|KEY|TOKEN|SECRET|PASSWORD|PASS|CREDENTIAL|COOKIE)($|_)/i;
+const SECRET_KEY_EXACT = new Set(['key', 'auth', 'password', 'passphrase', 'credential', 'credentials', 'cookie']);
+const SECRET_KEY_SUFFIXES = [
+  'apikey',
+  'token',
+  'secret',
+  'password',
+  'passphrase',
+  'credential',
+  'credentials',
+  'cookie',
+  'privatekey',
+];
 const SECRET_VALUE_PATTERNS = [
   /sk-[A-Za-z0-9_-]{16,}/g,
   /gh[pousr]_[A-Za-z0-9_]{16,}/g,
   /AKIA[0-9A-Z]{16}/g,
   /xox[baprs]-[A-Za-z0-9-]{16,}/g,
   /(telegram|bot)[-_]?(token)['"=: ]+[A-Za-z0-9:_-]{16,}/gi,
+  /\bBearer\s+[A-Za-z0-9._~+/=-]{16,}/g,
+  /-----BEGIN [A-Z ]*PRIVATE KEY-----/g,
+];
+const SECRET_ASSIGNMENT_PATTERNS = [
+  /\b(api[_-]?key|access[_-]?token|refresh[_-]?token|auth[_-]?token|bearer[_-]?token|client[_-]?secret|secret[_-]?key|private[_-]?key|password|passphrase|credential|cookie)\b\s*[:=]\s*["']?[^"'\s;]{4,}/gi,
 ];
 
 function canonical(value) {
@@ -29,16 +45,34 @@ function stableJson(value) {
   return value;
 }
 
+function normalizeKey(key) {
+  return String(key)
+    .replace(/([a-z0-9])([A-Z])/g, '$1_$2')
+    .toLowerCase()
+    .replace(/[^a-z0-9]/g, '');
+}
+
+function isSensitiveKey(key) {
+  const normalized = normalizeKey(key);
+  return SECRET_KEY_EXACT.has(normalized) || SECRET_KEY_SUFFIXES.some((suffix) => normalized.endsWith(suffix));
+}
+
+function matchesPattern(pattern, text) {
+  pattern.lastIndex = 0;
+  return pattern.test(text);
+}
+
+function hasSensitiveString(text) {
+  return [...SECRET_VALUE_PATTERNS, ...SECRET_ASSIGNMENT_PATTERNS].some((pattern) => matchesPattern(pattern, text));
+}
+
 function hasSensitiveContent(value) {
   if (Array.isArray(value)) return value.some(hasSensitiveContent);
   if (value && typeof value === 'object') {
-    return Object.entries(value).some(([key, item]) => SECRET_KEY_PATTERN.test(key) || hasSensitiveContent(item));
+    return Object.entries(value).some(([key, item]) => isSensitiveKey(key) || hasSensitiveContent(item));
   }
   if (typeof value !== 'string') return false;
-  return SECRET_VALUE_PATTERNS.some((pattern) => {
-    pattern.lastIndex = 0;
-    return pattern.test(value);
-  });
+  return hasSensitiveString(value);
 }
 
 function redact(value) {
@@ -46,13 +80,13 @@ function redact(value) {
   if (value && typeof value === 'object') {
     const out = {};
     for (const [key, item] of Object.entries(value)) {
-      out[key] = SECRET_KEY_PATTERN.test(key) ? '<redacted>' : redact(item);
+      out[key] = isSensitiveKey(key) ? '<redacted>' : redact(item);
     }
     return out;
   }
   if (typeof value !== 'string') return value;
   let text = value;
-  for (const pattern of SECRET_VALUE_PATTERNS) {
+  for (const pattern of [...SECRET_VALUE_PATTERNS, ...SECRET_ASSIGNMENT_PATTERNS]) {
     text = text.replace(pattern, '<redacted>');
   }
   return text.length > 2000 ? `${text.slice(0, 2000)}...<truncated>` : text;
