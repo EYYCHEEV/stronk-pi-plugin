@@ -3,17 +3,80 @@ import { accessSync, constants } from 'node:fs';
 
 const READ_ONLY_TOOLS = new Set(['read', 'grep', 'find', 'ls']);
 const MUTATING_TOOLS = new Set(['bash', 'write', 'edit', 'patch', 'apply_patch', 'multi_edit']);
-const SECRET_KEY_PATTERN = /(^|_)(API_KEY|KEY|TOKEN|SECRET|PASSWORD|PASS|CREDENTIAL|COOKIE)($|_)/i;
+const PLUGIN_TOOLS = new Set(['mcp', 'subagent']);
+const SECRET_KEY_EXACT = new Set(['key', 'auth', 'password', 'passphrase', 'credential', 'credentials', 'cookie']);
+const SECRET_KEY_SUFFIXES = [
+  'apikey',
+  'token',
+  'secret',
+  'password',
+  'passphrase',
+  'credential',
+  'credentials',
+  'cookie',
+  'privatekey',
+  'secretkey',
+];
 const SECRET_VALUE_PATTERNS = [
   /sk-[A-Za-z0-9_-]{16,}/g,
   /gh[pousr]_[A-Za-z0-9_]{16,}/g,
   /AKIA[0-9A-Z]{16}/g,
   /xox[baprs]-[A-Za-z0-9-]{16,}/g,
   /(telegram|bot)[-_]?(token)['"=: ]+[A-Za-z0-9:_-]{16,}/gi,
+  /\bBearer\s+[A-Za-z0-9._~+/=-]{16,}/g,
+  /-----BEGIN [A-Z ]*PRIVATE KEY-----/g,
 ];
+const ASSIGNMENT_PATTERN = /(^|[\s;,{])(["']?)([A-Za-z_][A-Za-z0-9_-]*)(["']?)\s*([:=])\s*(["']?)([^"'\s;,}]{4,})(["']?)/g;
 
 function canonical(value) {
-  return JSON.stringify(value, Object.keys(value ?? {}).sort());
+  return JSON.stringify(stableJson(value));
+}
+
+function stableJson(value) {
+  if (Array.isArray(value)) return value.map(stableJson);
+  if (value && typeof value === 'object') {
+    const out = {};
+    for (const key of Object.keys(value).sort()) {
+      out[key] = stableJson(value[key]);
+    }
+    return out;
+  }
+  return value;
+}
+
+function normalizeKey(key) {
+  return String(key)
+    .replace(/([a-z0-9])([A-Z])/g, '$1_$2')
+    .toLowerCase()
+    .replace(/[^a-z0-9]/g, '');
+}
+
+function isSensitiveKey(key) {
+  const normalized = normalizeKey(key);
+  return SECRET_KEY_EXACT.has(normalized) || SECRET_KEY_SUFFIXES.some((suffix) => normalized.endsWith(suffix));
+}
+
+function matchesPattern(pattern, text) {
+  pattern.lastIndex = 0;
+  return pattern.test(text);
+}
+
+function hasSensitiveString(text) {
+  if (SECRET_VALUE_PATTERNS.some((pattern) => matchesPattern(pattern, text))) return true;
+  ASSIGNMENT_PATTERN.lastIndex = 0;
+  for (let match = ASSIGNMENT_PATTERN.exec(text); match; match = ASSIGNMENT_PATTERN.exec(text)) {
+    if (isSensitiveKey(match[3])) return true;
+  }
+  return false;
+}
+
+function hasSensitiveContent(value) {
+  if (Array.isArray(value)) return value.some(hasSensitiveContent);
+  if (value && typeof value === 'object') {
+    return Object.entries(value).some(([key, item]) => isSensitiveKey(key) || hasSensitiveContent(item));
+  }
+  if (typeof value !== 'string') return false;
+  return hasSensitiveString(value);
 }
 
 function redact(value) {
@@ -21,7 +84,7 @@ function redact(value) {
   if (value && typeof value === 'object') {
     const out = {};
     for (const [key, item] of Object.entries(value)) {
-      out[key] = SECRET_KEY_PATTERN.test(key) ? '<redacted>' : redact(item);
+      out[key] = isSensitiveKey(key) ? '<redacted>' : redact(item);
     }
     return out;
   }
@@ -30,6 +93,9 @@ function redact(value) {
   for (const pattern of SECRET_VALUE_PATTERNS) {
     text = text.replace(pattern, '<redacted>');
   }
+  text = text.replace(ASSIGNMENT_PATTERN, (match, prefix, keyOpen, key, keyClose, operator, valueOpen, _value, valueClose) => (
+    isSensitiveKey(key) ? `${prefix}${keyOpen}${key}${keyClose}${operator}${valueOpen}<redacted>${valueClose}` : match
+  ));
   return text.length > 2000 ? `${text.slice(0, 2000)}...<truncated>` : text;
 }
 
@@ -126,6 +192,7 @@ async function handleToolCall(event) {
   const toolName = event?.toolName;
   if (!toolName) return block('tool_call missing toolName');
   if (isUnsupportedMutatingTool(toolName)) return block(`unsupported mutating tool denied: ${toolName}`);
+  if (hasSensitiveContent(event.input ?? {})) return block('sensitive content blocked in tool_call input');
 
   const before = canonical(event.input ?? {});
   let decision;
@@ -146,7 +213,7 @@ async function handleToolCall(event) {
     return block('tool_call payload mutated during guard evaluation');
   }
   if (!decision.allow) return block(decision.reason);
-  if (!READ_ONLY_TOOLS.has(toolName) && !MUTATING_TOOLS.has(toolName)) {
+  if (!READ_ONLY_TOOLS.has(toolName) && !MUTATING_TOOLS.has(toolName) && !PLUGIN_TOOLS.has(toolName)) {
     return block(`unknown tool denied by default: ${toolName}`);
   }
   return undefined;
@@ -154,6 +221,7 @@ async function handleToolCall(event) {
 
 async function handleUserBash(event) {
   const before = String(event?.command ?? '');
+  if (hasSensitiveContent(before)) return deniedBashResult('sensitive content blocked in user_bash command');
   let decision;
   try {
     decision = await guardedDecision({
@@ -192,6 +260,7 @@ export default async function stronkPi(pi) {
 
 export const internals = {
   canonical,
+  hasSensitiveContent,
   redact,
   helperArgv,
   runHelper,
