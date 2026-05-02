@@ -26,7 +26,7 @@ const SECRET_VALUE_PATTERNS = [
   /\bBearer\s+[A-Za-z0-9._~+/=-]{16,}/g,
   /-----BEGIN [A-Z ]*PRIVATE KEY-----/g,
 ];
-const ASSIGNMENT_PATTERN = /(^|[\s;])([A-Za-z_][A-Za-z0-9_-]*)\s*([:=])\s*["']?([^"'\s;]{4,})/g;
+const ASSIGNMENT_PATTERN = /(^|[\s;,{])(["']?)([A-Za-z_][A-Za-z0-9_-]*)(["']?)\s*([:=])\s*(["']?)([^"'\s;,}]{4,})(["']?)/g;
 
 function canonical(value) {
   return JSON.stringify(stableJson(value));
@@ -65,7 +65,7 @@ function hasSensitiveString(text) {
   if (SECRET_VALUE_PATTERNS.some((pattern) => matchesPattern(pattern, text))) return true;
   ASSIGNMENT_PATTERN.lastIndex = 0;
   for (let match = ASSIGNMENT_PATTERN.exec(text); match; match = ASSIGNMENT_PATTERN.exec(text)) {
-    if (isSensitiveKey(match[2])) return true;
+    if (isSensitiveKey(match[3])) return true;
   }
   return false;
 }
@@ -93,8 +93,8 @@ function redact(value) {
   for (const pattern of SECRET_VALUE_PATTERNS) {
     text = text.replace(pattern, '<redacted>');
   }
-  text = text.replace(ASSIGNMENT_PATTERN, (match, prefix, key, operator) => (
-    isSensitiveKey(key) ? `${prefix}${key}${operator}<redacted>` : match
+  text = text.replace(ASSIGNMENT_PATTERN, (match, prefix, keyOpen, key, keyClose, operator, valueOpen, _value, valueClose) => (
+    isSensitiveKey(key) ? `${prefix}${keyOpen}${key}${keyClose}${operator}${valueOpen}<redacted>${valueClose}` : match
   ));
   return text.length > 2000 ? `${text.slice(0, 2000)}...<truncated>` : text;
 }

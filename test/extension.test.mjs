@@ -256,7 +256,9 @@ process.stdin.on('end', () => {
     ['subagent', { action: 'run', input: { privateKey: 'plain-demo-value' } }],
     ['bash', { command: 'OPENAI_API_KEY=plain-demo-value some-tool' }],
     ['write', { path: 'notes.txt', content: 'MY_CLIENT_SECRET=plain-demo-value' }],
+    ['write', { path: 'config.json', content: '{"MY_CLIENT_SECRET":"plain-demo-value"}' }],
     ['edit', { path: 'notes.txt', edits: [{ oldText: 'x', newText: 'MY_ACCESS_TOKEN=plain-demo-value' }] }],
+    ['edit', { path: 'config.json', edits: [{ oldText: '{}', newText: '{"MY_ACCESS_TOKEN":"plain-demo-value"}' }] }],
   ];
   await withEnv({ STRONK_PI_HOOK_COMMAND_JSON: JSON.stringify([script]) }, async () => {
     for (const [toolName, input] of cases) {
@@ -285,6 +287,18 @@ test('inline secret assignment in user_bash returns a failed synthetic result', 
   await withEnv({ STRONK_PI_HOOK_COMMAND_JSON: JSON.stringify([allowScript()]) }, async () => {
     const result = await internals.handleUserBash({
       command: 'OPENAI_API_KEY=plain-demo-value some-tool',
+      cwd: process.cwd(),
+      excludeFromContext: false,
+    });
+    assert.equal(result.result.exitCode, 1);
+    assert.match(result.result.output, /sensitive content/);
+  });
+});
+
+test('quoted secret assignment in user_bash returns a failed synthetic result', async () => {
+  await withEnv({ STRONK_PI_HOOK_COMMAND_JSON: JSON.stringify([allowScript()]) }, async () => {
+    const result = await internals.handleUserBash({
+      command: 'printf \'{"OPENAI_API_KEY":"plain-demo-value"}\'',
       cwd: process.cwd(),
       excludeFromContext: false,
     });
@@ -333,6 +347,7 @@ process.stdin.on('end', () => {
         privateKey: 'plain-demo-value',
         output: `printf ${fakeSecret}`,
         command: 'MY_CLIENT_SECRET=plain-demo-value some-tool',
+        config: '{"MY_ACCESS_TOKEN":"plain-demo-value"}',
       },
     });
   });
