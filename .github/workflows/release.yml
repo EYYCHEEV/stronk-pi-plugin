@@ -1,0 +1,81 @@
+name: Release
+
+on:
+  workflow_dispatch:
+    inputs:
+      version:
+        description: Semver version matching package.json.
+        required: true
+        type: string
+
+permissions:
+  contents: write
+  id-token: write
+  attestations: write
+
+jobs:
+  release:
+    name: Release / Plugin
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4.4.0
+        with:
+          node-version: '24'
+          cache: npm
+      - run: npm ci --ignore-scripts
+      - run: npm run check
+      - name: Validate version input
+        run: |
+          set -euo pipefail
+          package_version="$(node -p "JSON.parse(require('node:fs').readFileSync('package.json', 'utf8')).version")"
+          if [ "$package_version" != "${{ inputs.version }}" ]; then
+            echo "version input ${{ inputs.version }} does not match package.json $package_version" >&2
+            exit 1
+          fi
+      - name: Build release artifact
+        run: |
+          set -euo pipefail
+          mkdir -p dist
+          asset="$(npm pack --pack-destination dist | tail -n 1)"
+          cd dist
+          sha256sum "$asset" > SHA256SUMS.txt
+          node -e '
+            const fs = require("node:fs");
+            const crypto = require("node:crypto");
+            const artifact = fs.readdirSync(".").find((name) => name.endsWith(".tgz"));
+            const bytes = fs.readFileSync(artifact);
+            const manifest = {
+              artifact,
+              byteSize: bytes.length,
+              createdAt: new Date().toISOString(),
+              sha256: crypto.createHash("sha256").update(bytes).digest("hex"),
+              sourceCommit: process.env.GITHUB_SHA,
+              sourceRepo: process.env.GITHUB_REPOSITORY,
+              tag: `stronk-pi-v${process.env.RELEASE_VERSION}`,
+              workflowRunId: process.env.GITHUB_RUN_ID
+            };
+            fs.writeFileSync("BUILD-MANIFEST.json", JSON.stringify(manifest, null, 2) + "\n");
+          '
+        env:
+          RELEASE_VERSION: ${{ inputs.version }}
+      - name: Generate artifact attestation
+        uses: actions/attest@59d89421af93a897026c735860bf21b6eb4f7b26 # v4
+        with:
+          subject-path: dist/*.tgz
+      - name: Publish release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          RELEASE_VERSION: ${{ inputs.version }}
+        run: |
+          set -euo pipefail
+          tag="stronk-pi-v${RELEASE_VERSION}"
+          gh release create "$tag" \
+            dist/*.tgz \
+            dist/SHA256SUMS.txt \
+            dist/BUILD-MANIFEST.json \
+            --repo "$GITHUB_REPOSITORY" \
+            --target "$GITHUB_SHA" \
+            --title "Stronk Pi v${RELEASE_VERSION}" \
+            --notes "Attested Stronk Pi plugin release ${RELEASE_VERSION}." \
+            --latest=false
