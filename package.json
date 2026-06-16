@@ -3,8 +3,14 @@
   "version": "0.1.0",
   "private": true,
   "type": "module",
-  "description": "Private Pi Coding Agent safety extension for the agentic workstation.",
+  "description": "Guarded Pi Coding Agent extension for Stronk Pi.",
   "main": "src/index.mjs",
+  "files": [
+    "README.md",
+    "package.json",
+    "src/",
+    "scripts/security-check.mjs"
+  ],
   "scripts": {
     "test": "node --test",
     "lint:security": "node scripts/security-check.mjs",
