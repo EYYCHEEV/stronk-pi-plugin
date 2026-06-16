@@ -544,10 +544,12 @@ test('glob tool finds files inside cwd and rejects path escapes', async () => {
   const dir = mkdtempSync(join(tmpdir(), 'stronk-pi-glob.'));
   mkdirSync(join(dir, 'docs'));
   writeFileSync(join(dir, 'docs', 'PLAN.md'), '# Plan\n');
+  writeFileSync(join(dir, '.hidden.md'), '# Hidden\n');
   writeFileSync(join(dir, 'notes.txt'), 'notes\n');
 
   const result = await internals.executeGlob({ pattern: '**/*.md' }, undefined, { cwd: dir });
   assert.match(result.content[0].text, /docs\/PLAN\.md/);
+  assert.doesNotMatch(result.content[0].text, /\.hidden\.md/);
 
   await assert.rejects(
     () => internals.executeGlob({ pattern: '**/*', path: '..' }, undefined, { cwd: dir }),
@@ -565,6 +567,52 @@ test('glob tool rejects symlink escapes from cwd', async () => {
     () => internals.executeGlob({ pattern: '**/*.md', path: 'outside' }, undefined, { cwd: dir }),
     /escapes/,
   );
+});
+
+test('glob tool falls back when ripgrep is unavailable', async () => {
+  const dir = mkdtempSync(join(tmpdir(), 'stronk-pi-glob-no-rg.'));
+  mkdirSync(join(dir, 'docs', 'nested'), { recursive: true });
+  writeFileSync(join(dir, 'docs', 'PLAN.md'), '# Plan\n');
+  writeFileSync(join(dir, 'docs', 'nested', 'DEEP.md'), '# Deep\n');
+  writeFileSync(join(dir, '.hidden.md'), '# Hidden\n');
+  const missingCommand = join(dir, 'missing-rg');
+
+  const result = await internals.executeGlobWithCommand(
+    { pattern: '*.md' },
+    undefined,
+    { cwd: dir },
+    missingCommand,
+  );
+  assert.match(result.content[0].text, /docs\/PLAN\.md/);
+  assert.match(result.content[0].text, /docs\/nested\/DEEP\.md/);
+  assert.doesNotMatch(result.content[0].text, /\.hidden\.md/);
+
+  const directChild = await internals.executeGlobWithCommand(
+    { pattern: 'docs/*.md' },
+    undefined,
+    { cwd: dir },
+    missingCommand,
+  );
+  assert.match(directChild.content[0].text, /docs\/PLAN\.md/);
+  assert.doesNotMatch(directChild.content[0].text, /docs\/nested\/DEEP\.md/);
+});
+
+test('glob fallback applies maxResults after sorting matches', async () => {
+  const dir = mkdtempSync(join(tmpdir(), 'stronk-pi-glob-order.'));
+  mkdirSync(join(dir, 'a'), { recursive: true });
+  writeFileSync(join(dir, 'a', 'a.md'), '# A\n');
+  writeFileSync(join(dir, 'y.md'), '# Y\n');
+  writeFileSync(join(dir, 'z.md'), '# Z\n');
+  const missingCommand = join(dir, 'missing-rg');
+
+  const result = await internals.executeGlobWithCommand(
+    { pattern: '**/*.md', maxResults: 1 },
+    undefined,
+    { cwd: dir },
+    missingCommand,
+  );
+  assert.equal(result.content[0].text, 'a/a.md');
+  assert.equal(result.details.truncated, true);
 });
 
 test('todowrite and todoread keep session todo state', async () => {

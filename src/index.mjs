@@ -1294,7 +1294,72 @@ function spawnCollect(command, args, options = {}) {
   });
 }
 
-async function executeGlob(params, signal, ctx) {
+function globPatternToRegex(pattern) {
+  const normalized = pattern.replace(/\\/g, '/');
+  let source = normalized.includes('/') ? '^' : '^(?:.*/)?';
+  for (let index = 0; index < normalized.length;) {
+    const char = normalized[index];
+    if (char === '*') {
+      if (normalized[index + 1] === '*') {
+        if (normalized[index + 2] === '/') {
+          source += '(?:[^/]+/)*';
+          index += 3;
+        } else {
+          source += '.*';
+          index += 2;
+        }
+        continue;
+      }
+      source += '[^/]*';
+      index += 1;
+      continue;
+    }
+    if (char === '?') {
+      source += '[^/]';
+      index += 1;
+      continue;
+    }
+    source += char.replace(/[|\\{}()[\]^$+?.]/g, '\\$&');
+    index += 1;
+  }
+  source += '$';
+  return new RegExp(source);
+}
+
+function hasHiddenPathSegment(relPath) {
+  return relPath.split('/').some((segment) => segment.startsWith('.'));
+}
+
+function fallbackGlobFiles(searchRoot, pattern, includeHidden, options = {}) {
+  const matcher = globPatternToRegex(pattern);
+  const deadline = Date.now() + (Number.isFinite(options.timeoutMs) ? options.timeoutMs : 5000);
+  const files = [];
+  const stack = ['.'];
+  while (stack.length > 0) {
+    if (options.signal?.aborted) throw new Error('glob fallback aborted');
+    if (Date.now() > deadline) throw new Error('glob fallback timed out');
+    const relDir = stack.pop();
+    const absDir = relDir === '.' ? searchRoot : join(searchRoot, relDir);
+    const entries = readdirSync(absDir, { withFileTypes: true })
+      .sort((left, right) => left.name.localeCompare(right.name));
+    for (const entry of entries.reverse()) {
+      if (entry.name === '.git') continue;
+      if (!includeHidden && entry.name.startsWith('.')) continue;
+      if (entry.isSymbolicLink()) continue;
+      const relPath = relDir === '.' ? entry.name : `${relDir}/${entry.name}`;
+      if (entry.isDirectory()) {
+        stack.push(relPath);
+        continue;
+      }
+      if (entry.isFile() && matcher.test(relPath)) {
+        files.push(relPath);
+      }
+    }
+  }
+  return files.sort();
+}
+
+async function executeGlobWithCommand(params, signal, ctx, command) {
   const cwd = cwdFromContext(ctx);
   const pattern = normalizedString(params.pattern, 'glob pattern');
   const searchRoot = resolveInsideCwd(cwd, params.path || '.');
@@ -1302,15 +1367,27 @@ async function executeGlob(params, signal, ctx) {
   const maxResults = Math.max(1, Math.min(Number(params.maxResults || 200), 1000));
   const args = ['--files', '--glob', pattern, '--glob', '!.git/**', '--sort', 'path'];
   if (params.includeHidden) args.unshift('--hidden');
-  const proc = await spawnCollect('rg', args, { cwd: searchRoot, signal, timeoutMs: 5000 });
-  if (proc.code !== 0 && proc.stdout.trim() === '') {
-    throw new Error(`glob failed: ${redact(proc.stderr).trim() || `rg exited ${proc.code}`}`);
+  let rawFiles;
+  try {
+    const proc = await spawnCollect(command, args, { cwd: searchRoot, signal, timeoutMs: 5000 });
+    if (proc.code !== 0 && proc.stdout.trim() === '') {
+      throw new Error(`glob failed: ${redact(proc.stderr).trim() || `rg exited ${proc.code}`}`);
+    }
+    rawFiles = proc.stdout
+      .split(/\r?\n/)
+      .map((line) => line.trim())
+      .filter(Boolean)
+      .filter((line) => params.includeHidden || !hasHiddenPathSegment(line));
+  } catch (error) {
+    if (error?.code !== 'ENOENT') throw error;
+    rawFiles = fallbackGlobFiles(searchRoot, pattern, Boolean(params.includeHidden), {
+      maxResults,
+      signal,
+      timeoutMs: 5000,
+    });
   }
   const rootRel = relative(cwd, searchRoot);
-  const files = proc.stdout
-    .split(/\r?\n/)
-    .map((line) => line.trim())
-    .filter(Boolean)
+  const files = rawFiles
     .map((line) => (rootRel ? `${rootRel}/${line}` : line))
     .slice(0, maxResults);
   const output = files.length ? files.join('\n') : '(no matches)';
@@ -1318,8 +1395,12 @@ async function executeGlob(params, signal, ctx) {
     pattern,
     path: rootRel || '.',
     count: files.length,
-    truncated: proc.stdout.split(/\r?\n/).filter(Boolean).length > files.length,
+    truncated: rawFiles.length > files.length,
   });
+}
+
+async function executeGlob(params, signal, ctx) {
+  return executeGlobWithCommand(params, signal, ctx, 'rg');
 }
 
 function normalizeTodoItem(item, index) {
@@ -1861,6 +1942,7 @@ export const internals = {
   createSkillAutocompleteProvider,
   installSkillAutocompleteProvider,
   registerStronkTools,
+  executeGlobWithCommand,
   executeGlob,
   normalizeTodos,
   executeTodoWrite,
