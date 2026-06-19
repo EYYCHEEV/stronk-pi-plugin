@@ -1419,7 +1419,7 @@ process.stdin.on('end', () => {
       cwd: process.cwd(),
     });
     assert.equal(result.block, true);
-    assert.match(result.reason, /sensitive content/);
+    assert.match(result.reason, /secret literal/);
   });
   assert.equal(existsSync(capture), false);
 });
@@ -1448,10 +1448,12 @@ test('benign code keyword arguments do not trigger sensitive-content prefilter',
 test('exact key assignments still block when the value has a secret shape', async () => {
   const fakeSecret = `sk-${'abcdefghijklmnopqrstuvwxyz'}`;
   assert.equal(internals.hasSensitiveContent({ command: `key=${fakeSecret} some-tool` }), true);
+  assert.equal(internals.hasBlockingSensitiveContent({ command: `key=${fakeSecret} some-tool` }), true);
+  assert.equal(internals.hasBlockingSensitiveContent({ command: 'OPENAI_API_KEY=plain-demo-value some-tool' }), false);
 });
 
-test('camelCase sensitive keys and inline assignments block before helper execution', async () => {
-  const dir = mkdtempSync(join(tmpdir(), 'stronk-pi-sensitive-block.'));
+test('sensitive key placeholders reach helper with redacted values', async () => {
+  const dir = mkdtempSync(join(tmpdir(), 'stronk-pi-sensitive-redact.'));
   const capture = join(dir, 'capture.json');
   const script = tempScript(`#!/usr/bin/env node
 import { writeFileSync } from 'node:fs';
@@ -1462,25 +1464,26 @@ process.stdin.on('end', () => {
   console.log(JSON.stringify({ allow: true, reason: 'ok' }));
 });
 `);
-  const cases = [
-    ['mcp', { tool: 'mock_echo', args: { apiKey: 'plain-demo-value' } }],
-    ['mcp', { tool: 'mock_echo', args: { secretKey: 'plain-demo-value' } }],
-    ['subagent', { action: 'run', input: { accessToken: 'plain-demo-value' } }],
-    ['subagent', { action: 'run', input: { privateKey: 'plain-demo-value' } }],
-    ['bash', { command: 'OPENAI_API_KEY=plain-demo-value some-tool' }],
-    ['write', { path: 'notes.txt', content: 'MY_CLIENT_SECRET=plain-demo-value' }],
-    ['write', { path: 'config.json', content: '{"MY_CLIENT_SECRET":"plain-demo-value"}' }],
-    ['edit', { path: 'notes.txt', edits: [{ oldText: 'x', newText: 'MY_ACCESS_TOKEN=plain-demo-value' }] }],
-    ['edit', { path: 'config.json', edits: [{ oldText: '{}', newText: '{"MY_ACCESS_TOKEN":"plain-demo-value"}' }] }],
-  ];
   await withEnv({ STRONK_PI_HOOK_COMMAND_JSON: JSON.stringify([script]) }, async () => {
-    for (const [toolName, input] of cases) {
-      const result = await internals.handleToolCall({ toolName, input, cwd: process.cwd() });
-      assert.equal(result.block, true);
-      assert.match(result.reason, /sensitive content/);
-    }
+    const result = await internals.handleToolCall({
+      toolName: 'mcp',
+      input: {
+        tool: 'mock_echo',
+        args: {
+          apiKey: 'plain-demo-value',
+          secretKey: 'another-placeholder',
+          command: 'OPENAI_API_KEY=plain-demo-value some-tool',
+        },
+      },
+      cwd: process.cwd(),
+    });
+    assert.equal(result, undefined);
   });
-  assert.equal(existsSync(capture), false);
+
+  const captured = readFileSync(capture, 'utf8');
+  assert.match(captured, /<redacted>/);
+  assert.doesNotMatch(captured, /plain-demo-value/);
+  assert.doesNotMatch(captured, /another-placeholder/);
 });
 
 test('secret-like user_bash command returns a failed synthetic result', async () => {
@@ -1492,31 +1495,44 @@ test('secret-like user_bash command returns a failed synthetic result', async ()
       excludeFromContext: false,
     });
     assert.equal(result.result.exitCode, 1);
-    assert.match(result.result.output, /sensitive content/);
+    assert.match(result.result.output, /secret literal/);
   });
 });
 
-test('inline secret assignment in user_bash returns a failed synthetic result', async () => {
-  await withEnv({ STRONK_PI_HOOK_COMMAND_JSON: JSON.stringify([allowScript()]) }, async () => {
+test('inline placeholder assignment in user_bash reaches helper redacted', async () => {
+  const dir = mkdtempSync(join(tmpdir(), 'stronk-pi-user-bash-redact.'));
+  const capture = join(dir, 'capture.json');
+  const script = tempScript(`#!/usr/bin/env node
+import { writeFileSync } from 'node:fs';
+let input = '';
+process.stdin.on('data', (chunk) => input += chunk);
+process.stdin.on('end', () => {
+  writeFileSync(${JSON.stringify(capture)}, input);
+  console.log(JSON.stringify({ allow: true, reason: 'ok' }));
+});
+`);
+  await withEnv({ STRONK_PI_HOOK_COMMAND_JSON: JSON.stringify([script]) }, async () => {
     const result = await internals.handleUserBash({
       command: 'OPENAI_API_KEY=plain-demo-value some-tool',
       cwd: process.cwd(),
       excludeFromContext: false,
     });
-    assert.equal(result.result.exitCode, 1);
-    assert.match(result.result.output, /sensitive content/);
+    assert.equal(result, undefined);
   });
+
+  const captured = readFileSync(capture, 'utf8');
+  assert.match(captured, /OPENAI_API_KEY=<redacted>/);
+  assert.doesNotMatch(captured, /plain-demo-value/);
 });
 
-test('quoted secret assignment in user_bash returns a failed synthetic result', async () => {
+test('quoted placeholder assignment in user_bash reaches helper redacted', async () => {
   await withEnv({ STRONK_PI_HOOK_COMMAND_JSON: JSON.stringify([allowScript()]) }, async () => {
     const result = await internals.handleUserBash({
       command: 'printf \'{"OPENAI_API_KEY":"plain-demo-value"}\'',
       cwd: process.cwd(),
       excludeFromContext: false,
     });
-    assert.equal(result.result.exitCode, 1);
-    assert.match(result.result.output, /sensitive content/);
+    assert.equal(result, undefined);
   });
 });
 
