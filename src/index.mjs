@@ -193,6 +193,10 @@ function hasSensitiveString(text) {
   return false;
 }
 
+function hasBlockingSensitiveString(text) {
+  return SECRET_VALUE_PATTERNS.some((pattern) => matchesPattern(pattern, text));
+}
+
 function hasSensitiveContent(value) {
   if (Array.isArray(value)) return value.some(hasSensitiveContent);
   if (value && typeof value === 'object') {
@@ -200,6 +204,15 @@ function hasSensitiveContent(value) {
   }
   if (typeof value !== 'string') return false;
   return hasSensitiveString(value);
+}
+
+function hasBlockingSensitiveContent(value) {
+  if (Array.isArray(value)) return value.some(hasBlockingSensitiveContent);
+  if (value && typeof value === 'object') {
+    return Object.values(value).some(hasBlockingSensitiveContent);
+  }
+  if (typeof value !== 'string') return false;
+  return hasBlockingSensitiveString(value);
 }
 
 function redact(value) {
@@ -747,24 +760,30 @@ function discoverSkillsFromRoot(root, { includeContents = true } = {}) {
       } catch {
         continue;
       }
-      if (!pathIsInside(root.path, resolved)) continue;
+      const visiblePath = resolve(candidate);
+      const visibleInsideRoot = pathIsInside(root.path, visiblePath);
+      const resolvedInsideRoot = pathIsInside(root.path, resolved);
+      if (!visibleInsideRoot) continue;
       if (stats.isDirectory()) {
+        if (!resolvedInsideRoot) continue;
         if (depth >= MAX_SKILL_SCAN_DEPTH || visited.has(resolved)) continue;
         visited.add(resolved);
         queue.push({ dir: resolved, depth: depth + 1 });
         continue;
       }
       if (!stats.isFile() || entry.name !== SKILL_FILENAME) continue;
+      if (!resolvedInsideRoot && root.scope !== 'user') continue;
       let contents;
       try {
-        contents = includeContents ? readFileSync(resolved, 'utf8') : readSkillMetadataSnippet(resolved);
+        contents = includeContents ? readFileSync(visiblePath, 'utf8') : readSkillMetadataSnippet(visiblePath);
       } catch {
         continue;
       }
-      const metadata = parseSkillMetadata(contents, resolved);
+      const metadata = parseSkillMetadata(contents, visiblePath);
       const skill = {
         ...metadata,
-        path: resolved,
+        path: visiblePath,
+        realPath: resolved,
         scope: root.scope,
       };
       if (includeContents) skill.contents = contents;
@@ -921,6 +940,16 @@ function normalizeLinkedSkillPath(rawPath, roots, cwd) {
   const absolute = isAbsolute(withoutPrefix) ? resolve(withoutPrefix) : resolve(cwd, withoutPrefix);
   if (basename(absolute).toLowerCase() !== SKILL_FILENAME.toLowerCase()) {
     throw new Error(`linked skill path must target ${SKILL_FILENAME}: ${rawPath}`);
+  }
+  const visibleRoot = roots.find((root) => pathIsInside(root.path, absolute));
+  if (visibleRoot) {
+    const resolved = canonicalizePossiblyMissingPath(absolute);
+    if (pathIsInside(visibleRoot.path, resolved)) return resolved;
+    const resolvedParent = canonicalizePossiblyMissingPath(dirname(absolute));
+    if (visibleRoot.scope === 'user' && pathIsInside(visibleRoot.path, resolvedParent)) {
+      return absolute;
+    }
+    throw new Error(`linked skill path is outside controlled skill roots: ${rawPath}`);
   }
   const resolved = canonicalizePossiblyMissingPath(absolute);
   if (!roots.some((root) => pathIsInside(root.path, resolved))) {
@@ -1768,7 +1797,7 @@ async function handleToolCall(event, ctx = {}) {
   if (!toolName) return block('tool_call missing toolName');
   if (isUnsupportedMutatingTool(toolName)) return block(`unsupported mutating tool denied: ${toolName}`);
   if (DISABLED_PLUGIN_TOOLS.has(toolName)) return block(`disabled upstream tool denied: ${toolName}; use ${SAFE_FETCH_TOOL}`);
-  if (hasSensitiveContent(event.input ?? {})) return block('sensitive content blocked in tool_call input');
+  if (hasBlockingSensitiveContent(event.input ?? {})) return block('secret literal blocked in tool_call input');
 
   const before = canonical(event.input ?? {});
   let decision;
@@ -1798,7 +1827,7 @@ async function handleToolCall(event, ctx = {}) {
 
 async function handleUserBash(event, ctx = {}) {
   const before = String(event?.command ?? '');
-  if (hasSensitiveContent(before)) return deniedBashResult('sensitive content blocked in user_bash command');
+  if (hasBlockingSensitiveContent(before)) return deniedBashResult('secret literal blocked in user_bash command');
   let decision;
   try {
     decision = await guardedDecision({
@@ -1922,6 +1951,7 @@ export default async function stronkPi(pi) {
 export const internals = {
   canonical,
   hasSensitiveContent,
+  hasBlockingSensitiveContent,
   redact,
   helperArgv,
   runHelper,
