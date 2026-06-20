@@ -3,14 +3,18 @@ import { accessSync, closeSync, constants, openSync, readdirSync, readFileSync, 
 import { request as httpRequest } from 'node:http';
 import { request as httpsRequest } from 'node:https';
 import { basename, dirname, join, isAbsolute, relative, resolve } from 'node:path';
+import { createSubagentFacade, facadeAdapterMode, facadeEnabled, stronkSubagentSchema } from './subagents/facade.mjs';
+import { PiSubagentsBridgeAdapter } from './subagents/adapters/pi-subagents-bridge.mjs';
 
 const SAFE_FETCH_TOOL = 'stronk_fetch_content';
+const STRONK_SUBAGENT_TOOL = 'stronk_subagent';
 const DISABLED_PLUGIN_TOOLS = new Set(['fetch_content']);
 const WEB_TOOLS = new Set(['web_search', 'code_search', SAFE_FETCH_TOOL, 'get_search_content']);
 const SESSION_TOOLS = new Set(['todowrite', 'todoread', 'question', 'ask_user']);
+const INTERCOM_TOOLS = new Set(['intercom', 'contact_supervisor']);
 const READ_ONLY_TOOLS = new Set(['read', 'grep', 'find', 'ls', 'glob', 'todoread']);
 const MUTATING_TOOLS = new Set(['bash', 'write', 'edit', 'patch', 'apply_patch', 'multi_edit']);
-const PLUGIN_TOOLS = new Set(['mcp', 'subagent', ...WEB_TOOLS, ...SESSION_TOOLS]);
+const PLUGIN_TOOLS = new Set(['mcp', 'subagent', STRONK_SUBAGENT_TOOL, ...WEB_TOOLS, ...SESSION_TOOLS, ...INTERCOM_TOOLS]);
 const SECRET_KEY_EXACT = new Set(['key', 'auth', 'password', 'passphrase', 'credential', 'credentials', 'cookie']);
 const SECRET_KEY_SUFFIXES = [
   'apikey',
@@ -1727,6 +1731,28 @@ async function executeFetchContent(params, signal, onUpdate) {
 
 function registerStronkTools(pi, state = { todos: [] }) {
   if (typeof pi.registerTool !== 'function') return;
+  if (facadeEnabled()) {
+    const adapter = facadeAdapterMode() === 'intercom'
+      ? new PiSubagentsBridgeAdapter({ events: pi.events })
+      : undefined;
+    const executeFacade = createSubagentFacade(adapter ? { adapter } : {});
+    pi.registerTool({
+      name: STRONK_SUBAGENT_TOOL,
+      label: STRONK_SUBAGENT_TOOL,
+      description: 'Run Stronk-managed Pi subagent lifecycle actions through a closed schema and private ledger.',
+      promptSnippet: 'Run a guarded Stronk Pi subagent action',
+      promptGuidelines: [
+        'Use stronk_subagent for Stronk-owned subagent lifecycle actions.',
+        'Raw upstream subagent management fields, model/tool overrides, worktrees, chains, and output-path hints are denied.',
+      ],
+      parameters: stronkSubagentSchema,
+      execute: async (...args) => {
+        const { params } = normalizeToolArgs(args);
+        const result = await executeFacade(params);
+        return toolResult(result.text, result.details);
+      },
+    });
+  }
   pi.registerTool({
     name: 'glob',
     label: 'glob',
@@ -1982,6 +2008,8 @@ export const internals = {
   requestUrlWithCheckedAddress,
   safeFetchUrl,
   executeFetchContent,
+  createSubagentFacade,
+  PiSubagentsBridgeAdapter,
   handleToolCall,
   handleUserBash,
   handleInput,
