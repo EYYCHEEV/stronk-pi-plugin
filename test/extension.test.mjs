@@ -294,6 +294,17 @@ test('registers Stronk Pi custom tools', async () => {
   assert.deepEqual(tools.map((tool) => tool.name).sort(), ['glob', 'question', 'stronk_fetch_content', 'todoread', 'todowrite']);
 });
 
+test('registers Stronk subagent facade only when enabled by launcher env', async () => {
+  const tools = [];
+  await withEnv({ STRONK_PI_SUBAGENT_FACADE: 'shadow' }, async () => {
+    await stronkPi({
+      on: () => {},
+      registerTool: (tool) => tools.push(tool),
+    });
+  });
+  assert.ok(tools.some((tool) => tool.name === 'stronk_subagent'));
+});
+
 test('Stronk safe fetch avoids pi-web-access fetch_content conflicts', async () => {
   const tools = new Map();
   const pi = {
