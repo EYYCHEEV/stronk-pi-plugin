@@ -1,5 +1,11 @@
 import { isTerminalStatus } from '../ledger.mjs';
 
+const DRY_RUN_PATCH = {
+  status: 'dry-run',
+  terminalResult: 'dry-run-completed',
+  cleanupState: 'none',
+};
+
 export class DryRunSubagentAdapter {
   constructor() {
     this.calls = [];
@@ -11,8 +17,8 @@ export class DryRunSubagentAdapter {
     await ledger.updateChild(child.childId, { status: 'running' }, 'child_running');
     return ledger.updateChild(
       child.childId,
-      { status: 'completed', terminalResult: 'dry-run-completed', cleanupState: 'none' },
-      'child_completed',
+      DRY_RUN_PATCH,
+      'child_dry_run',
     );
   }
 
@@ -20,7 +26,7 @@ export class DryRunSubagentAdapter {
     this.calls.push({ action: 'wait', childId });
     const child = await ledger.getChild(childId);
     if (!isTerminalStatus(child.status)) {
-      return ledger.updateChild(childId, { status: 'completed', terminalResult: 'dry-run-completed' }, 'child_completed');
+      return ledger.updateChild(childId, DRY_RUN_PATCH, 'child_dry_run');
     }
     return child;
   }

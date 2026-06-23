@@ -1,5 +1,5 @@
 {
-  "name": "stronk-pi",
+  "name": "stronk-pi-plugin",
   "version": "0.1.0",
   "private": true,
   "type": "module",
@@ -9,11 +9,13 @@
     "README.md",
     "package.json",
     "src/",
-    "scripts/security-check.mjs"
+    "scripts/security-check.mjs",
+    "scripts/installed-artifact-smoke.mjs"
   ],
   "scripts": {
     "test": "node --test",
     "lint:security": "node scripts/security-check.mjs",
+    "smoke:installed": "node scripts/installed-artifact-smoke.mjs",
     "check": "npm run test && npm run lint:security"
   },
   "engines": {
