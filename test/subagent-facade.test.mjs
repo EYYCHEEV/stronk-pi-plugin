@@ -104,12 +104,42 @@ test('stronk_subagent allows manifest-listed role without test allowlist', async
     const execute = createSubagentFacade();
     const result = parseResult(await execute({ action: 'spawn', role: 'executor', task: 'manifest-approved role' }));
 
-    assert.equal(result.child.status, 'completed');
+    assert.equal(result.child.status, 'dry-run');
     assert.equal(result.child.role, 'executor');
+    assert.deepEqual(result.warnings?.map((warning) => warning.code), ['dry_run_no_worker']);
   });
 });
 
-test('stronk_subagent dry-run spawn writes private redacted ledger state', async () => {
+test('stronk_subagent allows explicit local overlay role manifest', async () => {
+  const stateRoot = mkdtempSync(join(tmpdir(), 'stronk-pi-facade-local-manifest-role.'));
+  const manifestRoot = mkdtempSync(join(tmpdir(), 'stronk-pi-role-manifest.'));
+  const localRoot = mkdtempSync(join(tmpdir(), 'stronk-pi-local-role-manifest.'));
+  const rolesDir = join(manifestRoot, 'roles');
+  const localRolesDir = join(localRoot, 'roles');
+  mkdirSync(rolesDir);
+  mkdirSync(localRolesDir);
+  writeFileSync(join(rolesDir, 'executor.toml'), 'name = "executor"\n');
+  writeFileSync(join(localRolesDir, 'vision.toml'), 'name = "vision"\n');
+  const manifestPath = join(manifestRoot, 'roles.toml');
+  const localManifestPath = join(localRoot, 'roles.local.toml');
+  writeFileSync(manifestPath, '[paths]\ncodex_roles_dir = "roles"\n');
+  writeFileSync(localManifestPath, '[paths]\ncodex_roles_dir = "roles"\n');
+
+  await withEnv({
+    STRONK_PI_STATE_ROOT: stateRoot,
+    STRONK_PI_ROLE_MANIFEST: manifestPath,
+    STRONK_PI_ROLE_MANIFEST_LOCAL: localManifestPath,
+    STRONK_PI_FACADE_RUN_ID: 'facade-local-manifest-role-run',
+  }, async () => {
+    const execute = createSubagentFacade();
+    const result = parseResult(await execute({ action: 'spawn', role: 'vision', task: 'manifest-approved local role' }));
+
+    assert.equal(result.child.status, 'dry-run');
+    assert.equal(result.child.role, 'vision');
+  });
+});
+
+test('stronk_subagent dry-run propagation is distinct from real completion', async () => {
   const stateRoot = mkdtempSync(join(tmpdir(), 'stronk-pi-facade-state.'));
   const task = 'inspect without leaking FAKE_SECRET_VALUE_1234567890';
 
@@ -117,23 +147,35 @@ test('stronk_subagent dry-run spawn writes private redacted ledger state', async
     STRONK_PI_STATE_ROOT: stateRoot,
     STRONK_PI_FACADE_RUN_ID: 'facade-test-run',
     STRONK_PI_SUBAGENT_ADAPTER: 'dry-run',
-    STRONK_PI_RAW_SUBAGENT: 'enabled',
     STRONK_PI_FACADE_DEBUG: '1',
   }, async () => {
     const execute = createSubagentFacade({ allowedRoles: new Set(['executor']) });
     const result = parseResult(await execute({ action: 'spawn', role: 'executor', task }));
     const artifacts = result.artifacts;
 
-    assert.equal(result.child.status, 'completed');
+    assert.equal(result.child.status, 'dry-run');
+    assert.equal(result.child.terminalResult, 'dry-run-completed');
+    assert.equal(result.child.pid, null);
+    assert.equal(result.child.upstreamRunId, null);
+    assert.equal(result.child.intercomTarget, null);
+    assert.deepEqual(result.warnings, [{
+      code: 'dry_run_no_worker',
+      message: 'stronk_subagent dry-run completed without launching a worker; delegation output is unavailable',
+      terminalResult: 'dry-run-completed',
+    }]);
     assert.equal(mode(artifacts.runDir), 0o700);
     assert.equal(mode(artifacts.manifest), 0o600);
     assert.equal(mode(artifacts.children), 0o600);
     assert.equal(mode(artifacts.events), 0o600);
 
+    const manifest = readFileSync(artifacts.manifest, 'utf8');
     const children = readFileSync(artifacts.children, 'utf8');
     const events = readFileSync(artifacts.events, 'utf8');
+    assert.doesNotMatch(manifest, /raw_subagent/);
     assert.match(children, /taskSha256/);
     assert.match(events, /taskSha256/);
+    assert.match(events, /child_dry_run/);
+    assert.doesNotMatch(events, /child_completed/);
     assert.doesNotMatch(children, /FAKE_SECRET_VALUE/);
     assert.doesNotMatch(events, /FAKE_SECRET_VALUE/);
     assert.doesNotMatch(children, /inspect without leaking/);
@@ -259,7 +301,7 @@ test('stronk_subagent close is idempotent for terminal dry-run child', async () 
     const spawn = parseResult(await execute({ action: 'spawn', role: 'executor', task: 'finish immediately' }));
     const closed = parseResult(await execute({ action: 'close', childId: spawn.child.childId }));
 
-    assert.equal(closed.child.status, 'completed');
+    assert.equal(closed.child.status, 'dry-run');
     assert.equal(closed.child.cleanupState, 'already_closed');
   });
 });
@@ -280,7 +322,7 @@ test('stronk_subagent revive creates a new child linked to previous terminal chi
     assert.equal(revived.previousChildId, spawn.child.childId);
     assert.notEqual(revived.child.childId, spawn.child.childId);
     assert.equal(revived.child.previousChildId, spawn.child.childId);
-    assert.equal(revived.child.status, 'completed');
+    assert.equal(revived.child.status, 'dry-run');
   });
 });
 

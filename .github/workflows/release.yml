@@ -52,7 +52,7 @@ jobs:
               sha256: crypto.createHash("sha256").update(bytes).digest("hex"),
               sourceCommit: process.env.GITHUB_SHA,
               sourceRepo: process.env.GITHUB_REPOSITORY,
-              tag: `stronk-pi-v${process.env.RELEASE_VERSION}`,
+              tag: `stronk-pi-plugin-v${process.env.RELEASE_VERSION}`,
               workflowRunId: process.env.GITHUB_RUN_ID
             };
             fs.writeFileSync("BUILD-MANIFEST.json", JSON.stringify(manifest, null, 2) + "\n");
@@ -69,13 +69,13 @@ jobs:
           RELEASE_VERSION: ${{ inputs.version }}
         run: |
           set -euo pipefail
-          tag="stronk-pi-v${RELEASE_VERSION}"
+          tag="stronk-pi-plugin-v${RELEASE_VERSION}"
           gh release create "$tag" \
             dist/*.tgz \
             dist/SHA256SUMS.txt \
             dist/BUILD-MANIFEST.json \
             --repo "$GITHUB_REPOSITORY" \
             --target "$GITHUB_SHA" \
-            --title "Stronk Pi v${RELEASE_VERSION}" \
+            --title "Stronk Pi plugin v${RELEASE_VERSION}" \
             --notes "Attested Stronk Pi plugin release ${RELEASE_VERSION}." \
             --latest=false

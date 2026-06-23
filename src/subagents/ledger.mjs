@@ -4,7 +4,7 @@ import { homedir } from 'node:os';
 import { dirname, resolve, join } from 'node:path';
 
 const SCHEMA_VERSION = 1;
-const TERMINAL_STATUSES = new Set(['completed', 'failed', 'closed', 'interrupted', 'stale']);
+const TERMINAL_STATUSES = new Set(['completed', 'failed', 'closed', 'interrupted', 'stale', 'dry-run']);
 const pathLocks = new Map();
 
 function sha256(text) {
@@ -112,7 +112,7 @@ export function isTerminalStatus(status) {
 }
 
 export class SubagentLedger {
-  constructor({ cwd = process.cwd(), mode = 'dry-run', rawSubagent = 'enabled', maxChildren = 6, facadeRunId } = {}) {
+  constructor({ cwd = process.cwd(), mode = 'dry-run', maxChildren = 6, facadeRunId } = {}) {
     this.cwd = resolve(cwd || process.cwd());
     this.projectHash = repoHash(this.cwd);
     this.runId = runId(facadeRunId);
@@ -121,7 +121,6 @@ export class SubagentLedger {
     this.childrenPath = join(this.dir, 'children.json');
     this.eventsPath = join(this.dir, 'events.ndjson');
     this.mode = mode;
-    this.rawSubagent = rawSubagent;
     this.maxChildren = maxChildren;
   }
 
@@ -136,7 +135,6 @@ export class SubagentLedger {
       project_hash: this.projectHash,
       mode: this.mode,
       max_children: this.maxChildren,
-      raw_subagent: this.rawSubagent,
       created_at: nowIso(),
     };
     await writePrivateFileIfMissing(this.manifestPath, JSON.stringify(manifest, null, 2) + '\n');

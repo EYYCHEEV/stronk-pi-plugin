@@ -12,31 +12,43 @@ function resolveManifestRelative(manifestPath, rawPath) {
   return resolve(dirname(manifestPath), expanded);
 }
 
-function manifestRoles(manifestPath = process.env.STRONK_PI_ROLE_MANIFEST) {
-  if (!manifestPath) {
-    throw new Error('stronk_subagent role manifest required');
-  }
+function rolesFromManifest(manifestPath) {
+  if (!manifestPath) return new Set();
+  const resolvedManifest = resolve(manifestPath);
   let text;
   try {
-    text = readFileSync(manifestPath, 'utf8');
+    text = readFileSync(resolvedManifest, 'utf8');
   } catch {
     throw new Error(`stronk_subagent role manifest unreadable: ${manifestPath}`);
   }
-  const match = text.match(/codex_roles_dir\s*=\s*"([^"]+)"/);
-  if (!match) {
+  const matches = [...text.matchAll(/codex_roles_dir\s*=\s*"([^"]+)"/g)];
+  if (matches.length === 0) {
     throw new Error('stronk_subagent role manifest missing codex_roles_dir');
   }
-  const rolesDir = resolveManifestRelative(resolve(manifestPath), match[1]);
-  try {
-    return new Set(
-      readdirSync(rolesDir)
-        .filter((entry) => entry.endsWith('.toml'))
-        .map((entry) => entry.slice(0, -5))
-        .filter((entry) => statSync(resolve(rolesDir, `${entry}.toml`)).isFile()),
-    );
-  } catch {
-    throw new Error(`stronk_subagent role manifest roles dir unreadable: ${rolesDir}`);
+  const roles = new Set();
+  for (const match of matches) {
+    const rolesDir = resolveManifestRelative(resolvedManifest, match[1]);
+    try {
+      for (const entry of readdirSync(rolesDir)) {
+        if (!entry.endsWith('.toml')) continue;
+        const role = entry.slice(0, -5);
+        if (statSync(resolve(rolesDir, `${role}.toml`)).isFile()) roles.add(role);
+      }
+    } catch {
+      throw new Error(`stronk_subagent role manifest roles dir unreadable: ${rolesDir}`);
+    }
   }
+  return roles;
+}
+
+function manifestRoles(manifestPath = process.env.STRONK_PI_ROLE_MANIFEST, localManifestPath = process.env.STRONK_PI_ROLE_MANIFEST_LOCAL) {
+  if (!manifestPath) {
+    throw new Error('stronk_subagent role manifest required');
+  }
+  return new Set([
+    ...rolesFromManifest(manifestPath),
+    ...rolesFromManifest(localManifestPath),
+  ]);
 }
 
 function assertAllowedRole(role, allowedRoles = manifestRoles()) {
@@ -69,8 +81,21 @@ function debugArtifacts(ledger) {
   return process.env.STRONK_PI_FACADE_DEBUG === '1' ? { artifacts: ledger.artifactPaths() } : {};
 }
 
+function dryRunWarnings(payload = {}) {
+  const child = payload.child;
+  if (child?.status !== 'dry-run' && child?.terminalResult !== 'dry-run-completed') return [];
+  return [{
+    code: 'dry_run_no_worker',
+    message: 'stronk_subagent dry-run completed without launching a worker; delegation output is unavailable',
+    terminalResult: child.terminalResult ?? 'dry-run-completed',
+  }];
+}
+
 function facadeResult(action, ledger, payload = {}) {
-  const details = { ok: true, action, ...payload, ...debugArtifacts(ledger) };
+  const warnings = dryRunWarnings(payload);
+  const details = { ok: true, action, ...payload };
+  if (warnings.length > 0) details.warnings = warnings;
+  Object.assign(details, debugArtifacts(ledger));
   return {
     text: output(details),
     details,
@@ -90,10 +115,6 @@ export function facadeAdapterMode() {
   return process.env.STRONK_PI_SUBAGENT_ADAPTER || 'dry-run';
 }
 
-export function rawSubagentMode() {
-  return process.env.STRONK_PI_RAW_SUBAGENT || (facadeMode() === 'stronk' ? 'disabled' : 'enabled');
-}
-
 export function createSubagentFacade({ adapter = new DryRunSubagentAdapter(), ledgerFactory, allowedRoles, facadeRunId } = {}) {
   const stableFacadeRunId = facadeRunId || process.env.STRONK_PI_FACADE_RUN_ID || createFacadeRunId();
   return async function executeStronkSubagent(params = {}) {
@@ -102,7 +123,6 @@ export function createSubagentFacade({ adapter = new DryRunSubagentAdapter(), le
     const ledger = await (ledgerFactory?.(normalized) ?? new SubagentLedger({
       cwd: normalized.cwd || process.cwd(),
       mode: facadeAdapterMode(),
-      rawSubagent: rawSubagentMode(),
       maxChildren: MAX_CHILDREN,
       facadeRunId: stableFacadeRunId,
     })).init();
