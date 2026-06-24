@@ -2876,6 +2876,89 @@ test('image_read keeps default modes bounded by allowed image roots', async () =
   }
 });
 
+test('image_read registered tool allows explicit paths when Pi omits permission metadata', async () => {
+  const fixture = makeExternalImageFixture('image-read-registered-no-mode');
+  try {
+    const externalImage = writePng(fixture.externalRoot, 'outside-registered.png');
+    const tools = [];
+    const calls = [];
+    await stronkPi({
+      on: () => {},
+      registerTool: (tool) => tools.push(tool),
+    });
+    const imageRead = tools.find((tool) => tool.name === 'image_read');
+
+    const result = await withEnv(fixture.env, async () => imageRead.execute(
+      'live-tool-call-without-mode',
+      { paths: [externalImage], question: 'Describe this image.' },
+      undefined,
+      undefined,
+      {
+        cwd: fixture.cwd,
+        visionPreflight: async (request) => {
+          calls.push(request);
+          return {
+            images: request.images.map((image) => ({
+              label: image.label,
+              observed_facts: [`E1: ${image.displayName} was analyzed.`],
+              inferences: [],
+            })),
+          };
+        },
+      },
+    ));
+
+    const text = result.content[0].text;
+    assert.equal(calls.length, 1);
+    assert.deepEqual(calls[0].images.map((image) => image.displayName), ['outside-registered.png']);
+    assert.match(text, /Image Read complete: analyzed 1 image/);
+    assert.doesNotMatch(text, /path outside allowed image roots/);
+    assert.equal(text.includes(fixture.externalRoot), false);
+    assert.equal(JSON.stringify(result.details).includes(fixture.externalRoot), false);
+    assert.equal(JSON.stringify(calls[0].images).includes(fixture.externalRoot), false);
+  } finally {
+    fixture.cleanup();
+  }
+});
+
+test('image_read auto mode does not infer the restricted allowed-root policy', async () => {
+  const fixture = makeExternalImageFixture('image-read-auto-mode');
+  try {
+    const externalImage = writePng(fixture.externalRoot, 'outside-auto.png');
+    const calls = [];
+
+    const result = await internals.executeImageRead(
+      { paths: [externalImage] },
+      undefined,
+      {
+        cwd: fixture.cwd,
+        permissionMode: 'auto',
+        visionPreflight: async (request) => {
+          calls.push(request);
+          return {
+            images: request.images.map((image) => ({
+              label: image.label,
+              observed_facts: [`E1: ${image.displayName} was analyzed.`],
+              inferences: [],
+            })),
+          };
+        },
+      },
+      { env: fixture.env },
+    );
+
+    const text = result.content[0].text;
+    assert.equal(calls.length, 1);
+    assert.deepEqual(calls[0].images.map((image) => image.displayName), ['outside-auto.png']);
+    assert.match(text, /Image Read complete: analyzed 1 image/);
+    assert.doesNotMatch(text, /path outside allowed image roots/);
+    assert.equal(text.includes(fixture.externalRoot), false);
+    assert.equal(JSON.stringify(result.details).includes(fixture.externalRoot), false);
+  } finally {
+    fixture.cleanup();
+  }
+});
+
 test('image_read full-yolo mode accepts explicit paths and directory roots outside session roots', async () => {
   const fixture = makeExternalImageFixture('image-read-full-yolo');
   try {

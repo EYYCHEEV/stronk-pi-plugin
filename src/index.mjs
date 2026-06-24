@@ -178,6 +178,15 @@ const FULL_DISK_IMAGE_READ_MODES = new Set([
   'no-sandbox',
   'disabled',
 ]);
+const RESTRICTED_IMAGE_READ_MODES = new Set([
+  'default',
+  'read-only',
+  'read_only',
+  'workspace-write',
+  'workspace_write',
+  'workspace',
+  'restricted',
+]);
 const BUILTIN_VISION_PROVIDER_FALLBACKS = {
   'kimi-coding/kimi-for-coding': {
     providerName: 'kimi-coding',
@@ -1134,7 +1143,10 @@ function imageReadHasFullDiskRead(ctx = {}, env = process.env) {
 }
 
 function imageReadShouldEnforceAllowedRoots(ctx = {}, env = process.env) {
-  return !imageReadHasFullDiskRead(ctx, env);
+  const modes = imagePermissionModeCandidates(ctx, env)
+    .map((mode) => String(mode).trim().toLowerCase());
+  if (modes.some((mode) => FULL_DISK_IMAGE_READ_MODES.has(mode))) return false;
+  return modes.some((mode) => RESTRICTED_IMAGE_READ_MODES.has(mode));
 }
 
 function pathHasProtectedSegment(path) {
