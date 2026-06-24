@@ -27,8 +27,13 @@ takes that name.
 - Pi child write-swarms in real repos require launcher-owned SQLite task claims
   with explicit `OWNERSHIP`; `--scratch-write` is retained for guard tests.
 - Stronk-owned OpenCode parity tools registered here: `glob`, `todowrite`,
-  `todoread`, `question`, `web_search`, `code_search`, and guarded
-  `fetch_content`.
+  `todoread`, `question`, `image_read`, `web_search`, `code_search`, and
+  guarded `fetch_content`.
+- `image_read` is the explicit agentic image-reading tool for text-only models
+  that discover local image files after the prompt starts.
+  It accepts explicit paths and one bounded directory scan, then reuses the
+  configured image vision preflight model route, limits, timeout, safe failure
+  classification, Image Evidence Index, and image-scoped evidence IDs.
 - Stronk-owned `web_search` supports exactly `exa`, `brave`, `tavily`, and
   `gemini` via `STRONK_PI_SEARCH_PROVIDER`. Provider keys are read only from
   local environment variables: `EXA_API_KEY`, `BRAVE_SEARCH_API_KEY`,

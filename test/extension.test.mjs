@@ -1,4 +1,4 @@
-import { mkdtempSync, writeFileSync, chmodSync, readFileSync, existsSync, mkdirSync, realpathSync, symlinkSync } from 'node:fs';
+import { mkdtempSync, writeFileSync, chmodSync, readFileSync, existsSync, mkdirSync, realpathSync, rmSync, symlinkSync } from 'node:fs';
 import { createServer } from 'node:http';
 import { join } from 'node:path';
 import { tmpdir } from 'node:os';
@@ -277,6 +277,40 @@ function writeSkill(root, dirName, name, body = 'Skill body') {
   return skillPath;
 }
 
+const PNG_BYTES = Buffer.from('89504e470d0a1a0a0000000d4948445200000001000000010802000000907753de0000000c49444154789c63606060000000040001f61738550000000049454e44ae426082', 'hex');
+const PNG_BASE64 = PNG_BYTES.toString('base64');
+const TINY_GIF_BASE64 = 'R0lGODlhAQABAPAAAP///wAAACH5BAAAAAAALAAAAAABAAEAAAICRAEAOw==';
+
+function writePng(root, name = 'Screenshot 2026-06-23 at 10.00.00 AM.png') {
+  const path = join(root, name);
+  writeFileSync(path, PNG_BYTES);
+  return path;
+}
+
+function makeExternalImageFixture(prefix, extraEnv = {}) {
+  const externalRoot = mkdtempSync(join(process.cwd(), `tmp-${prefix}-outside.`));
+  const sessionRoot = mkdtempSync(join(tmpdir(), `stronk-pi-${prefix}-session.`));
+  const home = join(sessionRoot, 'home');
+  const tmp = join(sessionRoot, 'tmp');
+  mkdirSync(home);
+  mkdirSync(tmp);
+  return {
+    externalRoot,
+    sessionRoot,
+    cwd: join(sessionRoot, 'workspace'),
+    env: {
+      HOME: home,
+      TMPDIR: tmp,
+      STRONK_PI_STATE_ROOT: join(sessionRoot, '.stronk-pi'),
+      ...extraEnv,
+    },
+    cleanup() {
+      rmSync(externalRoot, { recursive: true, force: true });
+      rmSync(sessionRoot, { recursive: true, force: true });
+    },
+  };
+}
+
 function createAutocompleteFallbackProvider() {
   return {
     async getSuggestions() {
@@ -478,8 +512,12 @@ test('registers Stronk Pi custom tools', async () => {
     on: (name, handler) => handlers.set(name, handler),
     registerTool: (tool) => tools.push(tool),
   });
-  assert.deepEqual(tools.map((tool) => tool.name).sort(), ['code_search', 'fetch_content', 'glob', 'question', 'todoread', 'todowrite', 'web_search']);
+  assert.deepEqual(tools.map((tool) => tool.name).sort(), ['code_search', 'fetch_content', 'glob', 'image_read', 'question', 'todoread', 'todowrite', 'web_search']);
   const byName = new Map(tools.map((tool) => [tool.name, tool]));
+  assert.equal(byName.get('image_read').label, 'Image Read');
+  assert.match(byName.get('image_read').description, /text-only models/);
+  assert.equal(byName.get('image_read').parameters.properties.paths.type, 'array');
+  assert.equal(byName.get('image_read').parameters.properties.directory.type, 'string');
   assert.deepEqual(byName.get('web_search').parameters.properties.workflow.enum, ['auto', 'summary-review', 'none']);
   assert.deepEqual(byName.get('code_search').parameters.properties.workflow.enum, ['auto', 'summary-review', 'none']);
   assert.deepEqual(byName.get('web_search').parameters.properties.curatorAction.enum, ['keep', 'dismiss', 'fetch', 'fetch-kept', 'follow-up', 'finish', 'status']);
@@ -2425,6 +2463,2485 @@ process.stdin.on('end', () => {
   assert.deepEqual(notices, [['warning', 'slow down']]);
 });
 
+test('image preflight config reads the portable Stronk Pi config contract', () => {
+  const home = mkdtempSync(join(tmpdir(), 'stronk-pi-image-config-home.'));
+  const root = join(home, '.stronk-pi');
+  mkdirSync(join(root, 'config'), { recursive: true });
+  writeFileSync(join(root, 'config', 'defaults.toml'), [
+    'schema_version = 1',
+    '[models]',
+    'vision = "defaults/vision-model:xhigh"',
+    '[image_preflight]',
+    'enabled = true',
+    'max_images = 2',
+    'max_bytes = 4096',
+    'timeout_ms = 3000',
+    'max_output_tokens = 7000',
+    'failure_mode = "block"',
+    '',
+  ].join('\n'));
+  writeFileSync(join(root, 'config', 'roles.toml'), '[pi]\nvision_model = "roles/vision-model:xhigh"\n');
+  writeFileSync(join(root, 'config', 'roles.local.toml'), '[pi]\nvision_model = "local/vision-model:high"\n');
+
+  const config = internals.resolveVisionPreflightConfig({ env: { HOME: home } });
+
+  assert.equal(config.enabled, true);
+  assert.equal(config.model, 'local/vision-model:high');
+  assert.equal(config.maxImages, 2);
+  assert.equal(config.maxBytes, 4096);
+  assert.equal(config.timeoutMs, 3000);
+  assert.equal(config.maxOutputTokens, 7000);
+  assert.equal(config.failureMode, 'block');
+});
+
+test('image preflight image count defaults and clamps at twelve', () => {
+  assert.equal(
+    internals.resolveVisionPreflightConfig({ defaultsToml: '[image_preflight]\n' }).maxImages,
+    12,
+  );
+  assert.equal(
+    internals.resolveVisionPreflightConfig({
+      defaultsToml: '[image_preflight]\nmax_images = 12\n',
+    }).maxImages,
+    12,
+  );
+  assert.equal(
+    internals.resolveVisionPreflightConfig({
+      defaultsToml: '[image_preflight]\nmax_images = 99\n',
+    }).maxImages,
+    12,
+  );
+  assert.equal(
+    internals.resolveVisionPreflightConfig({
+      defaultsToml: '[image_preflight]\nmax_images = 0\n',
+    }).maxImages,
+    1,
+  );
+  assert.equal(
+    internals.resolveVisionPreflightConfig({
+      defaultsToml: '[image_preflight]\nmax_images = 4\n',
+      env: { STRONK_PI_IMAGE_PREFLIGHT_MAX_IMAGES: '99' },
+    }).maxImages,
+    12,
+  );
+});
+
+test('image preflight output token budget defaults and clamps safely', () => {
+  assert.equal(
+    internals.resolveVisionPreflightConfig({ defaultsToml: '[image_preflight]\n' }).maxOutputTokens,
+    4096,
+  );
+  assert.equal(
+    internals.resolveVisionPreflightConfig({
+      defaultsToml: '[image_preflight]\nmax_output_tokens = 128\n',
+    }).maxOutputTokens,
+    1024,
+  );
+  assert.equal(
+    internals.resolveVisionPreflightConfig({
+      defaultsToml: '[image_preflight]\nmax_output_tokens = 12000\n',
+    }).maxOutputTokens,
+    8192,
+  );
+  assert.equal(
+    internals.resolveVisionPreflightConfig({
+      defaultsToml: '[image_preflight]\nmax_output_tokens = 4096\n',
+      env: { STRONK_PI_IMAGE_PREFLIGHT_MAX_OUTPUT_TOKENS: '8192' },
+    }).maxOutputTokens,
+    8192,
+  );
+});
+
+test('image preflight model capability routing uses Pi model input metadata', () => {
+  const modelsJson = JSON.stringify({
+    providers: {
+      'alibaba-coding': {
+        models: [
+          { id: 'qwen3-coder-plus', input: ['text'] },
+          { id: 'qwen3.6-plus', input: ['text', 'image'] },
+        ],
+      },
+    },
+  });
+
+  assert.equal(
+    internals.modelSupportsImageInput({ model: 'alibaba-coding/qwen3.6-plus' }, {}, { modelsJson }),
+    true,
+  );
+  assert.equal(
+    internals.modelSupportsImageInput({ model: 'alibaba-coding/qwen3-coder-plus' }, {}, { modelsJson }),
+    false,
+  );
+  assert.equal(
+    internals.modelSupportsImageInput({}, { model: { id: 'custom-native', input: ['text', 'image'] } }, { modelsJson: '{}' }),
+    true,
+  );
+});
+
+test('image preflight active model routing ignores stale multimodal context metadata', () => {
+  const modelsJson = JSON.stringify({
+    providers: {
+      'alibaba-coding': {
+        models: [
+          { id: 'qwen3-coder-plus', input: ['text'] },
+          { id: 'qwen3.6-plus', input: ['text', 'image'] },
+        ],
+      },
+    },
+  });
+
+  assert.equal(
+    internals.modelSupportsImageInput(
+      { model: 'alibaba-coding/qwen3-coder-plus' },
+      { model: { provider: 'alibaba-coding', id: 'qwen3.6-plus', input: ['text', 'image'] } },
+      { modelsJson },
+    ),
+    false,
+  );
+  assert.equal(
+    internals.modelSupportsImageInput(
+      { model: 'alibaba-coding/qwen3.6-plus' },
+      { model: { provider: 'alibaba-coding', id: 'qwen3.6-plus', input: ['text', 'image'] } },
+      { modelsJson },
+    ),
+    true,
+  );
+  assert.equal(
+    internals.modelSupportsImageInput(
+      { model: 'alibaba-coding/qwen3-coder-plus' },
+      { model: { input: ['text', 'image'] } },
+      { modelsJson },
+    ),
+    false,
+  );
+});
+
+test('image preflight discovers pasted screenshot paths with spaces safely', () => {
+  const root = mkdtempSync(join(tmpdir(), 'stronk-pi-image-paths.'));
+  const imagePath = realpathSync(writePng(root));
+  const config = { maxImages: 4, maxBytes: 1024 * 1024 };
+  const text = `Please inspect "${imagePath}" before answering.`;
+
+  assert.deepEqual(internals.extractImagePathCandidates(text), [imagePath]);
+
+  const collected = internals.collectImageInputs(
+    { text },
+    { cwd: root },
+    config,
+    { env: { HOME: root, TMPDIR: tmpdir() } },
+  );
+
+  assert.equal(collected.images.length, 1);
+  assert.equal(collected.images[0].mediaType, 'image/png');
+  assert.equal(collected.images[0].path, imagePath);
+  assert.equal(collected.skipped.length, 0);
+});
+
+test('image preflight does not expand folders into image inputs', async () => {
+  const root = mkdtempSync(join(tmpdir(), 'stronk-pi-image-folder.'));
+  const folder = join(root, 'folder-with-images');
+  mkdirSync(folder);
+  writePng(folder, 'child.png');
+  let called = false;
+
+  const noImagePath = await withEnv(allowingPromptHookEnv(), async () => internals.handleInput(
+    {
+      text: `Go into ${folder} and read the images inside.`,
+      model: 'alibaba-coding/qwen3-coder-plus',
+    },
+    {
+      cwd: root,
+      visionPreflight: async () => {
+        called = true;
+      },
+    },
+  ));
+
+  assert.equal(noImagePath, undefined);
+  assert.equal(called, false);
+
+  const imageLikeFolder = join(root, 'gallery.png');
+  mkdirSync(imageLikeFolder);
+  writePng(imageLikeFolder, 'nested-child.png');
+  const skippedDirectory = await withEnv(allowingPromptHookEnv(), async () => internals.handleInput(
+    {
+      text: `Analyze ${imageLikeFolder}`,
+      model: 'alibaba-coding/qwen3-coder-plus',
+    },
+    {
+      cwd: root,
+      visionPreflight: async () => {
+        called = true;
+      },
+    },
+  ));
+
+  assert.equal(called, false);
+  assert.equal(skippedDirectory.action, 'transform');
+  assert.match(skippedDirectory.text, /image path is not a file/);
+  assert.doesNotMatch(skippedDirectory.text, /nested-child\.png/);
+});
+
+test('image_read analyzes explicit local image paths through the configured vision route', async () => {
+  const root = mkdtempSync(join(tmpdir(), 'stronk-pi-image-read-path.'));
+  const imagePath = realpathSync(writePng(root, 'tool-screenshot.png'));
+  const calls = [];
+  const tools = [];
+  await stronkPi({
+    on: () => {},
+    registerTool: (tool) => tools.push(tool),
+  });
+  const imageRead = tools.find((tool) => tool.name === 'image_read');
+
+  const result = await withEnv({ STRONK_PI_STATE_ROOT: join(root, '.stronk-pi') }, async () => imageRead.execute(
+    'tool-call-image-read',
+    {
+      paths: [imagePath],
+      question: `What changed in ${imagePath}?`,
+    },
+    undefined,
+    undefined,
+    {
+      cwd: root,
+      visionPreflight: async (request) => {
+        calls.push(request);
+        return {
+          images: [{
+            label: 'image-1',
+            observed_facts: ['E1: A green status indicator is visible.'],
+            inferences: ['I1: The status likely indicates success based on E1.'],
+          }],
+        };
+      },
+    },
+  ));
+
+  const text = result.content[0].text;
+  assert.equal(calls.length, 1);
+  assert.equal(calls[0].model, 'kimi-coding/kimi-for-coding:xhigh');
+  assert.equal(calls[0].messages[0].content.filter((part) => part.type === 'image').length, 1);
+  assert.match(calls[0].messages[0].content[0].text, /\[image-1; tool-screenshot\.png; analyzed by Stronk Pi image vision preflight]/);
+  assert.equal(calls[0].messages[0].content[0].text.includes(imagePath), false);
+  assert.equal(JSON.stringify(calls[0].images).includes(imagePath), false);
+  assert.equal(JSON.stringify(calls[0].images).includes(PNG_BASE64.slice(0, 24)), false);
+  assert.match(text, /^Image Read complete: analyzed 1 image\./);
+  assert.match(text, /<stronk-pi-image-vision-preflight>/);
+  assert.match(text, /Image Evidence Index:/);
+  assert.match(text, /image-1\.E1: A green status indicator is visible/);
+  assert.match(text, /image-1\.I1: The status likely indicates success based on image-1\.E1/);
+  assert.equal(text.includes(imagePath), false);
+  assert.equal(JSON.stringify(result.details).includes(imagePath), false);
+  assert.equal(JSON.stringify(result.details).includes(PNG_BASE64.slice(0, 24)), false);
+  assert.equal(result.details.tool, 'image_read');
+  assert.equal(result.details.imageCount, 1);
+});
+
+test('image_read scans one directory deterministically and does not recurse by default', async () => {
+  const root = mkdtempSync(join(tmpdir(), 'stronk-pi-image-read-dir.'));
+  const gallery = join(root, 'screens');
+  mkdirSync(gallery);
+  mkdirSync(join(gallery, 'nested'));
+  writePng(gallery, 'b-second.png');
+  writePng(gallery, 'a-first.png');
+  writePng(gallery, '.hidden.png');
+  writePng(join(gallery, 'nested'), 'c-nested.png');
+  writeFileSync(join(gallery, 'not-image.png'), 'not a real png');
+  writeFileSync(join(gallery, 'notes.txt'), 'not a screenshot');
+  const calls = [];
+
+  const result = await internals.executeImageRead(
+    { directory: gallery, max_images: 12 },
+    undefined,
+    {
+      cwd: root,
+      visionPreflight: async (request) => {
+        calls.push(request);
+        return {
+          images: request.images.map((image) => ({
+            label: image.label,
+            observed_facts: [`E1: ${image.displayName} was analyzed.`],
+            inferences: [`I1: ${image.displayName} is part of the requested folder.`],
+          })),
+        };
+      },
+    },
+    { env: { STRONK_PI_STATE_ROOT: join(root, '.stronk-pi') } },
+  );
+
+  const text = result.content[0].text;
+  assert.equal(calls.length, 1);
+  assert.deepEqual(calls[0].images.map((image) => image.displayName), ['a-first.png', 'b-second.png']);
+  assert.match(text, /Images analyzed: 2/);
+  assert.match(text, /Skipped Images:/);
+  assert.match(text, /\.hidden\.png: hidden path skipped/);
+  assert.match(text, /not-image\.png: unsupported MIME type image\/png/);
+  assert.doesNotMatch(text, /notes\.txt/);
+  assert.doesNotMatch(text, /c-nested\.png/);
+  assert.equal(text.includes(gallery), false);
+  assert.equal(JSON.stringify(result.details).includes(gallery), false);
+  assert.equal(JSON.stringify(calls[0].images).includes(gallery), false);
+});
+
+test('image_read directory scan reports the entry cap for large folders', async () => {
+  const root = mkdtempSync(join(tmpdir(), 'stronk-pi-image-read-large-dir.'));
+  const gallery = join(root, 'screens');
+  mkdirSync(gallery);
+  for (let index = 0; index < 520; index += 1) {
+    writeFileSync(join(gallery, `${String(index).padStart(3, '0')}.txt`), 'not an image');
+  }
+  const calls = [];
+
+  const result = await internals.executeImageRead(
+    { directory: gallery, max_images: 12 },
+    undefined,
+    {
+      cwd: root,
+      visionPreflight: async (request) => {
+        calls.push(request);
+        return { images: [] };
+      },
+    },
+    { env: { STRONK_PI_STATE_ROOT: join(root, '.stronk-pi') } },
+  );
+
+  const text = result.content[0].text;
+  assert.equal(calls.length, 0);
+  assert.match(text, /directory scan entry limit reached \(512\)/);
+  assert.equal(text.includes(gallery), false);
+  assert.equal(JSON.stringify(result.details).includes(gallery), false);
+});
+
+test('image_read rejects hidden and symlink directory roots before scanning', async () => {
+  const root = mkdtempSync(join(tmpdir(), 'stronk-pi-image-read-root-guard.'));
+  const hiddenGallery = join(root, '.screens');
+  const realGallery = join(root, 'screens');
+  const linkedGallery = join(root, 'linked-screens');
+  mkdirSync(hiddenGallery);
+  mkdirSync(realGallery);
+  writePng(hiddenGallery, 'hidden-child.png');
+  writePng(realGallery, 'linked-child.png');
+  symlinkSync(realGallery, linkedGallery, 'dir');
+  const calls = [];
+  const ctx = {
+    cwd: root,
+    visionPreflight: async (request) => {
+      calls.push(request);
+      return { images: [] };
+    },
+  };
+  const options = { env: { STRONK_PI_STATE_ROOT: join(root, '.stronk-pi') } };
+
+  const hiddenResult = await internals.executeImageRead({ directory: hiddenGallery }, undefined, ctx, options);
+  const symlinkResult = await internals.executeImageRead({ directory: linkedGallery }, undefined, ctx, options);
+
+  assert.equal(calls.length, 0);
+  assert.match(hiddenResult.content[0].text, /hidden directory root skipped/);
+  assert.doesNotMatch(hiddenResult.content[0].text, /hidden-child\.png/);
+  assert.match(symlinkResult.content[0].text, /symlink directory root skipped/);
+  assert.doesNotMatch(symlinkResult.content[0].text, /linked-child\.png/);
+});
+
+test('image_read keeps default modes bounded by allowed image roots', async () => {
+  const fixture = makeExternalImageFixture('image-read-default');
+  try {
+    const externalImage = writePng(fixture.externalRoot, 'outside-explicit.png');
+    const externalGallery = join(fixture.externalRoot, 'gallery');
+    mkdirSync(externalGallery);
+    writePng(externalGallery, 'outside-folder.png');
+    const calls = [];
+
+    const result = await internals.executeImageRead(
+      { paths: [externalImage], directory: externalGallery, max_images: 12 },
+      undefined,
+      {
+        cwd: fixture.cwd,
+        permissionMode: 'default',
+        visionPreflight: async (request) => {
+          calls.push(request);
+          return { images: [] };
+        },
+      },
+      { env: fixture.env },
+    );
+
+    const text = result.content[0].text;
+    assert.equal(calls.length, 0);
+    assert.match(text, /Image Read complete: analyzed 0 images; skipped 2 images/);
+    assert.match(text, /outside-explicit\.png: path outside allowed image roots/);
+    assert.match(text, /gallery: path outside allowed image roots/);
+    assert.equal(text.includes(fixture.externalRoot), false);
+    assert.equal(JSON.stringify(result.details).includes(fixture.externalRoot), false);
+  } finally {
+    fixture.cleanup();
+  }
+});
+
+test('image_read full-yolo mode accepts explicit paths and directory roots outside session roots', async () => {
+  const fixture = makeExternalImageFixture('image-read-full-yolo');
+  try {
+    const explicitImage = writePng(fixture.externalRoot, 'outside-explicit.png');
+    const externalGallery = join(fixture.externalRoot, 'gallery');
+    mkdirSync(externalGallery);
+    mkdirSync(join(externalGallery, 'nested'));
+    writePng(externalGallery, 'b-folder.png');
+    writePng(externalGallery, 'a-folder.png');
+    writePng(join(externalGallery, 'nested'), 'c-nested.png');
+    const calls = [];
+
+    const result = await internals.executeImageRead(
+      { paths: [explicitImage], directory: externalGallery, recursive: true, max_images: 12 },
+      undefined,
+      {
+        cwd: fixture.cwd,
+        permissionMode: 'full-yolo',
+        visionPreflight: async (request) => {
+          calls.push(request);
+          return {
+            images: request.images.map((image) => ({
+              label: image.label,
+              observed_facts: [`E1: ${image.displayName} was analyzed.`],
+              inferences: [],
+            })),
+          };
+        },
+      },
+      { env: fixture.env },
+    );
+
+    const text = result.content[0].text;
+    assert.equal(calls.length, 1);
+    assert.deepEqual(calls[0].images.map((image) => image.displayName), ['outside-explicit.png', 'a-folder.png', 'b-folder.png', 'c-nested.png']);
+    assert.match(text, /Image Read complete: analyzed 4 images/);
+    assert.doesNotMatch(text, /path outside allowed image roots/);
+    assert.match(text, /image-1\.E1: outside-explicit\.png was analyzed/);
+    assert.match(text, /image-2\.E1: a-folder\.png was analyzed/);
+    assert.match(text, /image-3\.E1: b-folder\.png was analyzed/);
+    assert.match(text, /image-4\.E1: c-nested\.png was analyzed/);
+    assert.equal(text.includes(fixture.externalRoot), false);
+    assert.equal(JSON.stringify(result.details).includes(fixture.externalRoot), false);
+    assert.equal(JSON.stringify(calls[0].images).includes(fixture.externalRoot), false);
+  } finally {
+    fixture.cleanup();
+  }
+});
+
+test('image_read full-disk sandbox env is not masked by default permission mode', async () => {
+  const fixture = makeExternalImageFixture('image-read-full-env', { CODEX_SANDBOX_MODE: 'disabled' });
+  try {
+    const explicitImage = writePng(fixture.externalRoot, 'outside-env.png');
+    const calls = [];
+
+    const result = await internals.executeImageRead(
+      { paths: [explicitImage] },
+      undefined,
+      {
+        cwd: fixture.cwd,
+        permissionMode: 'default',
+        visionPreflight: async (request) => {
+          calls.push(request);
+          return {
+            images: request.images.map((image) => ({
+              label: image.label,
+              observed_facts: [`E1: ${image.displayName} was analyzed.`],
+              inferences: [],
+            })),
+          };
+        },
+      },
+      { env: fixture.env },
+    );
+
+    const text = result.content[0].text;
+    assert.equal(calls.length, 1);
+    assert.deepEqual(calls[0].images.map((image) => image.displayName), ['outside-env.png']);
+    assert.match(text, /Image Read complete: analyzed 1 image/);
+    assert.doesNotMatch(text, /path outside allowed image roots/);
+    assert.equal(text.includes(fixture.externalRoot), false);
+    assert.equal(JSON.stringify(result.details).includes(fixture.externalRoot), false);
+  } finally {
+    fixture.cleanup();
+  }
+});
+
+test('prompt-time image preflight keeps path-root checks in full-disk modes', () => {
+  const fixture = makeExternalImageFixture('image-preflight-root', { CODEX_SANDBOX_MODE: 'disabled' });
+  try {
+    const externalImage = writePng(fixture.externalRoot, 'outside-prompt.png');
+
+    const collected = internals.collectImageInputs(
+      { text: externalImage, cwd: fixture.cwd, permissionMode: 'full-yolo' },
+      { cwd: fixture.cwd, permissionMode: 'full-yolo' },
+      { maxImages: 12, maxBytes: 5 * 1024 * 1024 },
+      { env: fixture.env },
+    );
+
+    assert.equal(collected.images.length, 0);
+    assert.equal(collected.skipped.length, 1);
+    assert.equal(collected.skipped[0].origin, 'event.text[0]');
+    assert.equal(collected.skipped[0].reason, 'path outside allowed image roots');
+  } finally {
+    fixture.cleanup();
+  }
+});
+
+test('image_read allows visible relative paths from a hidden cwd ancestor', async () => {
+  const root = mkdtempSync(join(tmpdir(), '.stronk-pi-image-read-hidden-cwd.'));
+  writePng(root, 'visible.png');
+  const screens = join(root, 'screens');
+  mkdirSync(screens);
+  writePng(screens, 'screen.png');
+  const calls = [];
+
+  const result = await internals.executeImageRead(
+    { paths: ['visible.png'], directory: 'screens' },
+    undefined,
+    {
+      cwd: root,
+      visionPreflight: async (request) => {
+        calls.push(request);
+        return {
+          images: request.images.map((image) => ({
+            label: image.label,
+            observed_facts: [`E1: ${image.displayName} was analyzed.`],
+            inferences: [],
+          })),
+        };
+      },
+    },
+    { env: { STRONK_PI_STATE_ROOT: join(root, '.stronk-pi') } },
+  );
+
+  const text = result.content[0].text;
+  assert.equal(calls.length, 1);
+  assert.deepEqual(calls[0].images.map((image) => image.displayName), ['visible.png', 'screen.png']);
+  assert.match(text, /Image Read complete: analyzed 2 images/);
+  assert.doesNotMatch(text, /hidden path skipped|hidden directory root skipped/);
+  assert.equal(text.includes(root), false);
+  assert.equal(JSON.stringify(result.details).includes(root), false);
+});
+
+test('image_read rejects directory roots whose realpath enters a hidden ancestor before enumeration', async () => {
+  const root = mkdtempSync(join(tmpdir(), 'stronk-pi-image-read-hidden-realpath.'));
+  const hiddenRoot = join(root, '.hidden-source');
+  const hiddenImages = join(hiddenRoot, 'images');
+  mkdirSync(hiddenImages, { recursive: true });
+  writePng(hiddenImages, 'hidden-secret.png');
+  const publicLink = join(root, 'public-link');
+  symlinkSync(hiddenRoot, publicLink, 'dir');
+  const calls = [];
+
+  const result = await internals.executeImageRead(
+    { directory: join(publicLink, 'images') },
+    undefined,
+    {
+      cwd: root,
+      visionPreflight: async (request) => {
+        calls.push(request);
+        return { images: [] };
+      },
+    },
+    { env: { STRONK_PI_STATE_ROOT: join(root, '.stronk-pi') } },
+  );
+
+  const text = result.content[0].text;
+  assert.equal(calls.length, 0);
+  assert.match(text, /hidden directory root skipped/);
+  assert.doesNotMatch(text, /hidden-secret\.png/);
+  assert.equal(text.includes(hiddenRoot), false);
+});
+
+test('image_read rejects explicit hidden protected and symlink paths before vision', async () => {
+  const root = mkdtempSync(join(tmpdir(), 'stronk-pi-image-read-path-guard.'));
+  const realImage = writePng(root, 'real.png');
+  const hiddenFile = writePng(root, '.hidden.png');
+  const hiddenDir = join(root, '.screens');
+  mkdirSync(hiddenDir);
+  const hiddenChild = writePng(hiddenDir, 'hidden-child.png');
+  const protectedDir = join(root, '.ssh');
+  mkdirSync(protectedDir);
+  const protectedImage = writePng(protectedDir, 'secret.png');
+  const symlinkImage = join(root, 'linked.png');
+  symlinkSync(realImage, symlinkImage);
+  const calls = [];
+
+  const result = await internals.executeImageRead(
+    { paths: [hiddenFile, hiddenChild, protectedImage, symlinkImage] },
+    undefined,
+    {
+      cwd: root,
+      visionPreflight: async (request) => {
+        calls.push(request);
+        return { images: [] };
+      },
+    },
+    { env: { STRONK_PI_STATE_ROOT: join(root, '.stronk-pi') } },
+  );
+
+  const text = result.content[0].text;
+  assert.equal(calls.length, 0);
+  assert.match(text, /\.hidden\.png: hidden path skipped/);
+  assert.match(text, /hidden-child\.png: hidden path skipped/);
+  assert.match(text, /secret\.png: protected local path denied/);
+  assert.match(text, /linked\.png: symlink path skipped/);
+  for (const path of [hiddenFile, hiddenChild, protectedImage, symlinkImage]) {
+    assert.equal(text.includes(path), false);
+    assert.equal(JSON.stringify(result.details).includes(path), false);
+  }
+});
+
+test('image_read can call configured OpenAI-compatible vision provider without path leaks', async () => {
+  const root = mkdtempSync(join(tmpdir(), 'stronk-pi-image-read-provider.'));
+  const stateRoot = join(root, '.stronk-pi');
+  mkdirSync(join(stateRoot, 'agent'), { recursive: true });
+  mkdirSync(join(stateRoot, 'config'), { recursive: true });
+  writeFileSync(join(stateRoot, 'agent', 'models.json'), JSON.stringify({
+    providers: {
+      'vision-provider': {
+        api: 'openai-completions',
+        apiKey: '$VISION_API_KEY',
+        baseUrl: 'https://vision.example/v1',
+        models: [
+          { id: 'vision-large', input: ['text', 'image'] },
+        ],
+      },
+    },
+  }));
+  writeFileSync(join(stateRoot, 'config', 'defaults.toml'), [
+    '[image_preflight]',
+    'enabled = true',
+    'model = "vision-provider/vision-large"',
+    '',
+  ].join('\n'));
+  const imagePath = writePng(root, 'provider.png');
+  const unrelatedPath = join(root, 'notes', 'secret.txt');
+  const linuxEtcPath = '/etc/passwd';
+  const linuxRootPath = '/root/.ssh/id_ed25519';
+  const optPath = '/opt/private/foo.png';
+  const srvPath = '/srv/data/x.png';
+  const mntPath = '/mnt/share/x.png';
+  const applicationsPath = '/Applications/Secret.app/screen.png';
+  const appSupportPath = '/Users/alice/Library/Application Support/App/secret.png';
+  const mobileDocumentsPath = '/Users/alice/Library/Mobile Documents/com~apple~CloudDocs/secret.png';
+  const fileUrlWithSpaces = 'file:///Users/alice/My Docs/x.png';
+  const publicUrl = 'https://example.com/docs/image.png';
+  const mimeToken = 'image/png';
+  const modelToken = 'kimi-coding/kimi-for-coding';
+  const ratioToken = '16/9';
+  const rawGifDataUrl = `data:image/gif;base64,${TINY_GIF_BASE64}`;
+  const fetchFn = captureFetch({
+    choices: [{
+      message: {
+        content: JSON.stringify({
+          images: [{
+            label: 'image-1',
+            observed_facts: [`E1: The provider image was analyzed while echoing ${unrelatedPath}, ${linuxEtcPath}, ${linuxRootPath}, ${optPath}, ${srvPath}, ${mntPath}, ${applicationsPath}, ${appSupportPath}, ${mobileDocumentsPath}, ${fileUrlWithSpaces}, ${publicUrl}, ${mimeToken}, ${modelToken}, ${ratioToken}, and ${rawGifDataUrl}.`],
+            inferences: ['I1: The provider fallback is wired based on E1.'],
+          }],
+        }),
+      },
+    }],
+  });
+
+  const result = await internals.executeImageRead(
+    { paths: [imagePath], question: `Inspect ${imagePath}; compare with ${unrelatedPath}; ${linuxEtcPath}; ${linuxRootPath}; ${optPath}; ${srvPath}; ${mntPath}; ${applicationsPath}; "${appSupportPath}"; '${mobileDocumentsPath}'; ${fileUrlWithSpaces}; keep ${publicUrl}; ${mimeToken}; ${modelToken}; ${ratioToken}; ignore ${rawGifDataUrl}; directory ${root}` },
+    undefined,
+    { cwd: root, fetch: fetchFn },
+    {
+      env: {
+        STRONK_PI_STATE_ROOT: stateRoot,
+        VISION_API_KEY: 'vision-test-key',
+      },
+      fetch: fetchFn,
+    },
+  );
+
+  assert.equal(fetchFn.calls.length, 1);
+  assert.equal(fetchFn.calls[0].url, 'https://vision.example/v1/chat/completions');
+  const payload = requestBody(fetchFn.calls[0]);
+  assert.equal(payload.model, 'vision-large');
+  assert.equal(payload.max_tokens, 4096);
+  assert.equal(payload.messages[0].role, 'system');
+  assert.equal(payload.messages[1].content[1].type, 'image_url');
+  assert.match(payload.messages[1].content[1].image_url.url, /^data:image\/png;base64,/);
+  assert.equal(payload.messages[1].content[0].text.includes(imagePath), false);
+  assert.equal(payload.messages[1].content[0].text.includes(unrelatedPath), false);
+  assert.equal(payload.messages[1].content[0].text.includes(root), false);
+  assert.equal(payload.messages[1].content[0].text.includes(linuxEtcPath), false);
+  assert.equal(payload.messages[1].content[0].text.includes(linuxRootPath), false);
+  assert.equal(payload.messages[1].content[0].text.includes(optPath), false);
+  assert.equal(payload.messages[1].content[0].text.includes(srvPath), false);
+  assert.equal(payload.messages[1].content[0].text.includes(mntPath), false);
+  assert.equal(payload.messages[1].content[0].text.includes(applicationsPath), false);
+  assert.equal(payload.messages[1].content[0].text.includes(appSupportPath), false);
+  assert.equal(payload.messages[1].content[0].text.includes(mobileDocumentsPath), false);
+  assert.equal(payload.messages[1].content[0].text.includes(fileUrlWithSpaces), false);
+  assert.equal(payload.messages[1].content[0].text.includes('Application Support'), false);
+  assert.equal(payload.messages[1].content[0].text.includes('Mobile Documents'), false);
+  assert.equal(payload.messages[1].content[0].text.includes('My Docs'), false);
+  assert.equal(payload.messages[1].content[0].text.includes(publicUrl), true);
+  assert.equal(payload.messages[1].content[0].text.includes(mimeToken), true);
+  assert.equal(payload.messages[1].content[0].text.includes(modelToken), true);
+  assert.equal(payload.messages[1].content[0].text.includes(ratioToken), true);
+  assert.equal(payload.messages[1].content[0].text.includes('.ssh'), false);
+  assert.doesNotMatch(payload.messages[1].content[0].text, /data:image\/gif;base64/);
+  assert.doesNotMatch(payload.messages[1].content[0].text, new RegExp(TINY_GIF_BASE64.slice(0, 16)));
+  assert.match(result.content[0].text, /image-1\.E1: The provider image was analyzed/);
+  assert.equal(result.content[0].text.includes(imagePath), false);
+  assert.equal(result.content[0].text.includes(unrelatedPath), false);
+  assert.equal(result.content[0].text.includes(root), false);
+  assert.equal(result.content[0].text.includes(linuxEtcPath), false);
+  assert.equal(result.content[0].text.includes(linuxRootPath), false);
+  assert.equal(result.content[0].text.includes(optPath), false);
+  assert.equal(result.content[0].text.includes(srvPath), false);
+  assert.equal(result.content[0].text.includes(mntPath), false);
+  assert.equal(result.content[0].text.includes(applicationsPath), false);
+  assert.equal(result.content[0].text.includes(appSupportPath), false);
+  assert.equal(result.content[0].text.includes(mobileDocumentsPath), false);
+  assert.equal(result.content[0].text.includes(fileUrlWithSpaces), false);
+  assert.equal(result.content[0].text.includes('Application Support'), false);
+  assert.equal(result.content[0].text.includes('Mobile Documents'), false);
+  assert.equal(result.content[0].text.includes('My Docs'), false);
+  assert.equal(result.content[0].text.includes(publicUrl), true);
+  assert.equal(result.content[0].text.includes(mimeToken), true);
+  assert.equal(result.content[0].text.includes(modelToken), true);
+  assert.equal(result.content[0].text.includes(ratioToken), true);
+  assert.equal(result.content[0].text.includes('.ssh'), false);
+  assert.doesNotMatch(result.content[0].text, /data:image\/gif;base64/);
+  assert.doesNotMatch(result.content[0].text, new RegExp(TINY_GIF_BASE64.slice(0, 16)));
+});
+
+test('image_read recursive directory scan is explicit and remains bounded by max_images', async () => {
+  const root = mkdtempSync(join(tmpdir(), 'stronk-pi-image-read-recursive.'));
+  const gallery = join(root, 'screens');
+  mkdirSync(join(gallery, 'nested'), { recursive: true });
+  const first = writePng(gallery, 'a-first.png');
+  const second = writePng(join(gallery, 'nested'), 'b-nested.png');
+  const third = writePng(join(gallery, 'nested'), 'c-extra.png');
+  const calls = [];
+
+  const result = await internals.executeImageRead(
+    { directory: gallery, recursive: true, max_images: 2 },
+    undefined,
+    {
+      cwd: root,
+      visionPreflight: async (request) => {
+        calls.push(request);
+        return {
+          images: request.images.map((image) => ({
+            label: image.label,
+            observed_facts: [`E1: ${image.displayName} was analyzed.`],
+            inferences: [],
+          })),
+        };
+      },
+    },
+    { env: { STRONK_PI_STATE_ROOT: join(root, '.stronk-pi') } },
+  );
+
+  const text = result.content[0].text;
+  assert.equal(calls.length, 1);
+  assert.deepEqual(calls[0].images.map((image) => image.displayName), ['a-first.png', 'b-nested.png']);
+  assert.match(text, /max_images limit reached \(2\)/);
+  assert.equal(text.includes(first), false);
+  assert.equal(text.includes(second), false);
+  assert.equal(text.includes(third), false);
+});
+
+test('image_read stops explicit path normalization once max_images is reached', async () => {
+  const root = mkdtempSync(join(tmpdir(), 'stronk-pi-image-read-max-paths.'));
+  const first = writePng(root, 'first.png');
+  const missing = join(root, 'missing.png');
+  const calls = [];
+
+  const result = await internals.executeImageRead(
+    { paths: [first, missing], max_images: 1 },
+    undefined,
+    {
+      cwd: root,
+      visionPreflight: async (request) => {
+        calls.push(request);
+        return {
+          images: request.images.map((image) => ({
+            label: image.label,
+            observed_facts: [`E1: ${image.displayName} was analyzed.`],
+            inferences: [],
+          })),
+        };
+      },
+    },
+    { env: { STRONK_PI_STATE_ROOT: join(root, '.stronk-pi') } },
+  );
+
+  const text = result.content[0].text;
+  assert.equal(calls.length, 1);
+  assert.deepEqual(calls[0].images.map((image) => image.displayName), ['first.png']);
+  assert.match(text, /missing\.png: max_images limit reached \(1\)/);
+  assert.doesNotMatch(text, /image path does not exist/);
+  assert.equal(text.includes(missing), false);
+});
+
+test('image_read preserves partial summaries without assigning evidence to another image', async () => {
+  const root = mkdtempSync(join(tmpdir(), 'stronk-pi-image-read-partial.'));
+  const first = writePng(root, 'first.png');
+  const second = writePng(root, 'second.png');
+
+  const result = await internals.executeImageRead(
+    { paths: [first, second] },
+    undefined,
+    {
+      cwd: root,
+      visionPreflight: async () => ({
+        images: [{
+          label: 'image-1',
+          observed_facts: ['E1: First image has a dark header.'],
+          inferences: ['I1: First image is the baseline based on E1.'],
+        }],
+      }),
+    },
+    { env: { STRONK_PI_STATE_ROOT: join(root, '.stronk-pi') } },
+  );
+
+  const text = result.content[0].text;
+  const observedSection = text.split('Observed Facts:')[1].split('Uncertainties And Limits:')[0];
+  assert.match(text, /Vision summaries returned: 1/);
+  assert.match(observedSection, /image-1 \(first\.png; image\/png; \d+ bytes\)\n- image-1\.E1: First image has a dark header/);
+  assert.match(observedSection, /image-2 \(second\.png; image\/png; \d+ bytes\)\n- No structured observed facts were returned\./);
+  assert.doesNotMatch(observedSection, /image-2\.E1: First image has a dark header/);
+});
+
+test('image_read redacts provider-echoed paths and image data from successful summaries', async () => {
+  const root = mkdtempSync(join(tmpdir(), 'stronk-pi-image-read-success-redaction.'));
+  const imagePath = writePng(root, 'echoed.png');
+  const wrappedGifDataUrl = `data:image/gif;base64,${TINY_GIF_BASE64.slice(0, 16)}\n${TINY_GIF_BASE64.slice(16)}`;
+
+  const result = await internals.executeImageRead(
+    { paths: [imagePath] },
+    undefined,
+    {
+      cwd: root,
+      visionPreflight: async () => ({
+        images: [{
+          label: 'image-1',
+          observed_facts: [
+            `E1: Provider echoed ${imagePath} and data:image/png;base64,${PNG_BASE64}.`,
+            `E2: Provider echoed tiny image data ${TINY_GIF_BASE64} and ${wrappedGifDataUrl}.`,
+          ],
+          visible_text: [{
+            id: 'T1',
+            text: `Nested echo ${imagePath}`,
+            note: `Raw payload ${PNG_BASE64} and tiny ${TINY_GIF_BASE64}`,
+            [imagePath]: 'path-shaped provider key',
+            [`data:image/png;base64,${PNG_BASE64}`]: 'payload-shaped provider key',
+          }, {
+            [imagePath]: 'rendered path key',
+            [`data:image/png;base64,${PNG_BASE64}`]: 'first colliding rendered payload key',
+            [`data:image/png;base64,${PNG_BASE64}AA`]: 'second colliding rendered payload key',
+          }, {
+            [wrappedGifDataUrl]: 'wrapped tiny rendered payload key',
+            [TINY_GIF_BASE64]: 'tiny raw rendered payload key',
+          }],
+          inferences: [`I1: The echoed path does not belong in model-facing output based on E1.`],
+        }],
+      }),
+    },
+    { env: { STRONK_PI_STATE_ROOT: join(root, '.stronk-pi') } },
+  );
+
+  const text = result.content[0].text;
+  assert.match(text, /image-1\.E1: Provider echoed \[image-1; echoed\.png; analyzed by Stronk Pi image vision preflight] and <redacted image data>/);
+  assert.match(text, /image-1\.E2: Provider echoed tiny image data <redacted image data> and <redacted image data>/);
+  assert.match(text, /Nested echo \[image-1; echoed\.png; analyzed by Stronk Pi image vision preflight]/);
+  assert.match(text, /Raw payload <redacted image data> and tiny <redacted image data>/);
+  assert.match(text, /\[image-1; echoed\.png; analyzed by Stronk Pi image vision preflight]=rendered path key/);
+  assert.match(text, /<redacted image data>=first colliding rendered payload key/);
+  assert.match(text, /<redacted image data>_2=second colliding rendered payload key/);
+  assert.match(text, /<redacted image data>=wrapped tiny rendered payload key/);
+  assert.match(text, /<redacted image data>_2=tiny raw rendered payload key/);
+  assert.equal(text.includes(imagePath), false);
+  assert.doesNotMatch(text, /data:image\/png;base64/);
+  assert.doesNotMatch(text, new RegExp(PNG_BASE64.slice(0, 24)));
+  assert.doesNotMatch(text, /data:image\/gif;base64/);
+  assert.doesNotMatch(text, new RegExp(TINY_GIF_BASE64.slice(0, 16)));
+});
+
+test('image_read returns bounded failure context without raw provider payloads or paths', async () => {
+  const root = mkdtempSync(join(tmpdir(), 'stronk-pi-image-read-failure.'));
+  const imagePath = writePng(root, 'failure.png');
+
+  const result = await internals.executeImageRead(
+    { paths: [imagePath] },
+    undefined,
+    {
+      cwd: root,
+      visionPreflight: async () => {
+        throw new Error(`provider echoed ${imagePath} and data:image/png;base64,${PNG_BASE64}`);
+      },
+    },
+    { env: { STRONK_PI_STATE_ROOT: join(root, '.stronk-pi') } },
+  );
+
+  const text = result.content[0].text;
+  assert.match(text, /^Image Read failed with bounded reason: vision provider request failed\./);
+  assert.match(text, /Preflight status: failed \(vision provider request failed\)/);
+  assert.doesNotMatch(text, /data:image\/png;base64/);
+  assert.doesNotMatch(text, new RegExp(PNG_BASE64.slice(0, 24)));
+  assert.equal(text.includes(imagePath), false);
+  assert.equal(JSON.stringify(result.details).includes(imagePath), false);
+  assert.equal(result.details.failure, 'vision provider request failed');
+});
+
+test('text-only image preflight injects structured context and strips raw images', async () => {
+  const root = mkdtempSync(join(tmpdir(), 'stronk-pi-image-preflight.'));
+  const imagePath = writePng(root);
+  const calls = [];
+  const notices = [];
+
+  const result = await withEnv(allowingPromptHookEnv({ STRONK_PI_STATE_ROOT: join(root, '.stronk-pi') }), async () => (
+    internals.handleInput(
+      {
+        text: `What changed in ${imagePath}?`,
+        model: 'alibaba-coding/qwen3-coder-plus',
+        images: [{ source: { type: 'base64', mediaType: 'image/png', data: PNG_BASE64 } }],
+      },
+      {
+        cwd: root,
+        hasUI: true,
+        ui: { notify: (message, kind) => notices.push([kind, message]) },
+        visionPreflight: async (request) => {
+          calls.push(request);
+          return {
+            images: [
+              {
+                label: 'image-1',
+                observed_facts: ['The screenshot shows a green status indicator.'],
+                inferences: ['The workflow likely completed successfully.'],
+              },
+              {
+                label: 'image-2',
+                observed_facts: ['A single-pixel PNG was attached.'],
+                inferences: ['The attachment is probably a test fixture.'],
+              },
+            ],
+          };
+        },
+      },
+    )
+  ));
+
+  assert.equal(result.action, 'transform');
+  assert.deepEqual(result.images, []);
+  assert.match(result.text, /^What changed in \[image-2; /);
+  assert.match(result.text, /analyzed by Stronk Pi image vision preflight/);
+  assert.equal(result.text.split('<stronk-pi-image-vision-preflight>')[0].includes(imagePath), false);
+  assert.match(result.text, /<stronk-pi-image-vision-preflight>/);
+  assert.match(result.text, /Do not call file or image read tools/);
+  assert.match(result.text, /Observed Facts:/);
+  assert.match(result.text, /The screenshot shows a green status indicator/);
+  assert.match(result.text, /Inferences And Context:/);
+  assert.match(result.text, /workflow likely completed successfully/);
+  assert.doesNotMatch(result.text, new RegExp(PNG_BASE64.slice(0, 24)));
+  assert.equal(calls.length, 1);
+  assert.equal(calls[0].model, 'kimi-coding/kimi-for-coding:xhigh');
+  assert.equal(calls[0].messages[0].content.filter((part) => part.type === 'image').length, 2);
+  assert.deepEqual(notices, [
+    ['info', 'Stronk Pi detected 2 images for a text-only model; analyzing with vision preflight.'],
+    ['info', 'Image vision preflight complete: analyzed 2 images.'],
+  ]);
+  const noticeText = notices.map(([_kind, message]) => message).join('\n');
+  assert.equal(noticeText.includes(imagePath), false);
+  assert.equal(noticeText.includes(PNG_BASE64.slice(0, 24)), false);
+});
+
+test('text-only image preflight accepts twelve images in one request', async () => {
+  const root = mkdtempSync(join(tmpdir(), 'stronk-pi-image-preflight-twelve.'));
+  const imagePaths = Array.from({ length: 12 }, (_value, index) => writePng(root, `image-${String(index + 1).padStart(2, '0')}.png`));
+  const calls = [];
+  const notices = [];
+
+  const result = await withEnv(allowingPromptHookEnv({ STRONK_PI_STATE_ROOT: join(root, '.stronk-pi') }), async () => (
+    internals.handleInput(
+      {
+        text: `Compare these images:\n${imagePaths.join('\n')}`,
+        model: 'alibaba-coding/qwen3-coder-plus',
+      },
+      {
+        cwd: root,
+        hasUI: true,
+        ui: { notify: (message, kind) => notices.push([kind, message]) },
+        visionPreflight: async (request) => {
+          calls.push(request);
+          return {
+            images: imagePaths.map((_path, index) => ({
+              label: `image-${index + 1}`,
+              observed_facts: [`Image ${index + 1} was analyzed.`],
+              inferences: [`Image ${index + 1} has a bounded summary.`],
+            })),
+          };
+        },
+      },
+    )
+  ));
+
+  assert.equal(result.action, 'transform');
+  assert.equal(result.images, undefined);
+  assert.equal(calls.length, 1);
+  assert.equal(calls[0].messages[0].content.filter((part) => part.type === 'image').length, 12);
+  assert.deepEqual(calls[0].images.map((image) => image.label), imagePaths.map((_path, index) => `image-${index + 1}`));
+  assert.match(result.text, /Images analyzed: 12/);
+  assert.match(result.text, /Image 12 was analyzed/);
+  assert.doesNotMatch(result.text, /Skipped Images:/);
+  for (const imagePath of imagePaths) assert.equal(result.text.includes(imagePath), false);
+  assert.deepEqual(notices, [
+    ['info', 'Stronk Pi detected 12 images for a text-only model; analyzing with vision preflight.'],
+    ['info', 'Image vision preflight complete: analyzed 12 images.'],
+  ]);
+});
+
+test('image preflight prompt asks for universal evidence-rich structured context', () => {
+  const request = internals.buildVisionRequest(
+    [
+      {
+        label: 'image-1',
+        displayName: 'dashboard.png',
+        origin: 'event.text[0]',
+        mediaType: 'image/png',
+        byteLength: 1234,
+        contentPart: { type: 'image', source: { type: 'base64', media_type: 'image/png', data: PNG_BASE64 } },
+      },
+    ],
+    { model: 'vision-provider/vision-large', maxOutputTokens: 4096 },
+    { text: 'Review this dashboard screenshot.' },
+  );
+
+  assert.equal(request.model, 'vision-provider/vision-large');
+  assert.match(request.systemPrompt, /evidence-rich context/);
+  assert.match(request.systemPrompt, /Turn any supplied image/);
+  assert.match(request.systemPrompt, /image_type/);
+  assert.match(request.systemPrompt, /image-1\.E1/);
+  assert.match(request.systemPrompt, /<label>\.E#/);
+  assert.match(request.systemPrompt, /scene_and_composition/);
+  assert.match(request.systemPrompt, /subjects_and_entities/);
+  assert.match(request.systemPrompt, /structured_content/);
+  assert.match(request.systemPrompt, /domain_specific_details/);
+  assert.match(request.systemPrompt, /Do not force every image into a UI or screenshot schema/);
+  assert.match(request.systemPrompt, /visible_text/);
+  assert.match(request.systemPrompt, /negative_evidence/);
+  assert.match(request.systemPrompt, /For photos, preserve subjects, setting, composition/);
+  assert.match(request.systemPrompt, /For documents, screenshots, charts, diagrams, maps, code, or terminal images/);
+  assert.match(request.systemPrompt, /Never say something is absent or missing/);
+  assert.match(request.messages[0].content[0].text, /downstream text-only model can answer/);
+  assert.match(request.messages[0].content[0].text, /Use the labels from the image inventory exactly/);
+});
+
+test('image preflight renders rich evidence schema and overclaim guardrails', async () => {
+  const root = mkdtempSync(join(tmpdir(), 'stronk-pi-image-rich-schema.'));
+  const imagePath = writePng(root);
+
+  const result = await withEnv(allowingPromptHookEnv({ STRONK_PI_STATE_ROOT: join(root, '.stronk-pi') }), async () => (
+    internals.handleInput(
+      {
+        text: `Critique this UI screenshot ${imagePath}`,
+        model: 'neuralwatt/glm-5.2:xhigh',
+      },
+      {
+        cwd: root,
+        visionPreflight: async () => ({
+          images: [
+            {
+              label: 'image-1',
+              overview: 'A Chinese-language issue tracker screen is visible.',
+              quality_flags: ['E1: Text is mostly legible; screenshot is a cropped desktop viewport.'],
+              layout: [
+                { id: 'E2', observation: 'A left navigation rail and a central issue-list area are visible.', location: 'full viewport', confidence: 'high' },
+              ],
+              visible_text: [
+                { id: 'E3', text: '问题, 搜索, 通知, 新问题, 打开 19, 已关闭 3', location: 'navigation and list header', confidence: 'high' },
+              ],
+              ui_elements: [
+                { id: 'E4', role: 'button', label: '+ 新问题', location: 'top right', state: 'enabled', confidence: 'high' },
+              ],
+              data_entities: ['E5: Visible issue ids include ISS-00022 through ISS-00008.'],
+              counts_and_density: [
+                { id: 'E6', observation: 'About 15 issue rows are visible in the central list area.', confidence: 'medium' },
+              ],
+              observed_facts: [
+                'E7: Colored issue tags are visible, including 异常 and 高优先级.',
+              ],
+              uncertainties: [
+                'U1: It is unclear whether the list uses cards or strict table rows because column boundaries are not explicit.',
+              ],
+              negative_evidence: [
+                { id: 'N1', claim: 'priority column', scope: 'visible list header only', status: 'not visible', note: 'Do not claim the product lacks priority data.' },
+              ],
+              inferences: [
+                'I1: This is likely an issue-management UI based on E2, E3, and E5.',
+              ],
+              guardrails: [
+                'Do not call the UI low-density without citing E6 or comparable spacing evidence.',
+              ],
+            },
+          ],
+        }),
+      },
+    )
+  ));
+
+  assert.equal(result.action, 'transform');
+  assert.match(result.text, /Evidence rule: omitted, unknown, unreadable, cropped, or not-visible details are unavailable, not absent/);
+  assert.match(result.text, /Overview:/);
+  assert.match(result.text, /A Chinese-language issue tracker screen is visible/);
+  assert.match(result.text, /Image Type, Quality, And Scope:/);
+  assert.match(result.text, /Scene And Composition:/);
+  assert.match(result.text, /Visible Text And Symbols:/);
+  assert.match(result.text, /问题, 搜索, 通知, 新问题/);
+  assert.match(result.text, /Domain-Specific Details:/);
+  assert.match(result.text, /image-1\.E4: \+ 新问题 \(role=button; location=top right; state=enabled; confidence=high\)/);
+  assert.match(result.text, /Attributes, Counts, And State:/);
+  assert.match(result.text, /About 15 issue rows are visible/);
+  assert.match(result.text, /Uncertainties And Limits:/);
+  assert.match(result.text, /Scoped Negative Evidence:/);
+  assert.match(result.text, /image-1\.N1: priority column \(scope=visible list header only; status=not visible; note=Do not claim the product lacks priority data\.\)/);
+  assert.match(result.text, /Guardrails For Text-Only Model:/);
+  assert.doesNotMatch(result.text, /\[object Object]/);
+  assert.equal(result.images?.length ?? 0, 0);
+});
+
+test('image preflight renders universal photo and structured document evidence', () => {
+  const context = internals.renderVisionContext({
+    config: { model: 'vision-provider/vision-large' },
+    images: [
+      {
+        label: 'image-1',
+        displayName: 'street-food-photo.png',
+        origin: 'event.images[0]',
+        mediaType: 'image/png',
+        byteLength: 1234,
+      },
+      {
+        label: 'image-2',
+        displayName: 'quarterly-chart.png',
+        origin: 'event.images[1]',
+        mediaType: 'image/png',
+        byteLength: 2345,
+      },
+    ],
+    summaryImages: [
+      {
+        label: 'image-1',
+        image_type: 'photo',
+        overview: 'A close photo shows a plated meal on a table with utensils nearby.',
+        scene_and_composition: [
+          'E1: The plate is centered in the frame with a tabletop filling the background.',
+        ],
+        subjects_and_entities: [
+          { id: 'E2', observation: 'A round plate holds several browned bread pieces.', location: 'center', confidence: 'high' },
+        ],
+        attributes_and_state: [
+          'E3: The food appears golden-brown with darker toasted spots.',
+        ],
+        spatial_relationships: [
+          'E4: A fork sits to the left of the plate and a glass is behind it.',
+        ],
+        observed_facts: [
+          'E5: No visible packaging or recipe text is present in the frame.',
+        ],
+        uncertainties: [
+          'U1: The exact filling or ingredients are not visible from the outside.',
+        ],
+        inferences: [
+          'I1: The meal may be baked or toasted based on E3.',
+        ],
+      },
+      {
+        label: 'image-2',
+        image_type: 'chart/document',
+        overview: 'A report page contains a quarterly revenue bar chart and a short note.',
+        visible_text: [
+          'E10: Visible title text reads "Q2 Revenue by Region".',
+        ],
+        structured_content: [
+          { id: 'E11', observation: 'A vertical bar chart compares APAC, EMEA, and Americas.', confidence: 'high' },
+          { id: 'E12', observation: 'The tallest visible bar is labeled APAC.', evidence: 'E10,E11' },
+        ],
+        domain_specific_details: [
+          'E13: The chart has a y-axis with currency-like tick labels, but exact values are small.',
+        ],
+        uncertainties: [
+          'U2: The smallest y-axis tick labels are not readable.',
+        ],
+        negative_evidence: [
+          { id: 'N1', claim: 'line chart', scope: 'visible chart area', status: 'not visible', note: 'Only bars are visible.' },
+        ],
+        inferences: [
+          'I2: The page likely summarizes regional sales performance based on E10 and E11.',
+        ],
+      },
+    ],
+  });
+
+  assert.match(context, /Image Type, Quality, And Scope:/);
+  assert.match(context, /photo/);
+  assert.match(context, /chart\/document/);
+  assert.match(context, /Scene And Composition:/);
+  assert.match(context, /The plate is centered/);
+  assert.match(context, /Subjects, Objects, And Entities:/);
+  assert.match(context, /image-1\.E2: A round plate holds several browned bread pieces/);
+  assert.match(context, /Attributes, Counts, And State:/);
+  assert.match(context, /golden-brown/);
+  assert.match(context, /Relationships And Activity:/);
+  assert.match(context, /A fork sits to the left/);
+  assert.match(context, /Visible Text And Symbols:/);
+  assert.match(context, /Q2 Revenue by Region/);
+  assert.match(context, /Structured Content And Data:/);
+  assert.match(context, /vertical bar chart compares APAC/);
+  assert.match(context, /Domain-Specific Details:/);
+  assert.match(context, /currency-like tick labels/);
+  assert.match(context, /Scoped Negative Evidence:/);
+  assert.match(context, /image-2\.N1: line chart \(scope=visible chart area; status=not visible; note=Only bars are visible\.\)/);
+  assert.match(context, /Inferences And Context:/);
+  assert.match(context, /image-1\.I1: The meal may be baked or toasted based on image-1\.E3/);
+  assert.match(context, /image-2\.E12: The tallest visible bar is labeled APAC\. \(evidence=image-2\.E10,image-2\.E11\)/);
+  assert.doesNotMatch(context, /UI Elements And Data:/);
+  assert.doesNotMatch(context, /\[object Object]/);
+});
+
+test('image preflight renders duplicate evidence ids as image-scoped citations', () => {
+  const context = internals.renderVisionContext({
+    config: { model: 'vision-provider/vision-large' },
+    images: [
+      {
+        label: 'image-1',
+        displayName: 'before.png',
+        origin: 'event.images[0]',
+        mediaType: 'image/png',
+        byteLength: 111,
+      },
+      {
+        label: 'image-2',
+        displayName: 'after.png',
+        origin: 'event.images[1]',
+        mediaType: 'image/png',
+        byteLength: 222,
+      },
+    ],
+    summaryImages: [
+      {
+        label: 'image-1',
+        observed_facts: [
+          'E1: A dark dashboard header is visible.',
+          { id: 'E2', observation: 'A blue action button appears on the right.' },
+        ],
+        uncertainties: ['U1: The small status text is not readable.'],
+        inferences: ['I1: The screen is likely a dashboard based on E1 and E2.'],
+      },
+      {
+        label: 'image-2',
+        observed_facts: [
+          'E1: A light dashboard header is visible.',
+          { id: 'E2', observation: 'A green confirmation banner appears below the header.' },
+        ],
+        negative_evidence: [{ id: 'N1', claim: 'error banner', scope: 'visible viewport', status: 'not visible' }],
+        inferences: ['I1: The workflow may have succeeded based on E2 and N1.'],
+      },
+    ],
+  });
+
+  assert.match(context, /Evidence IDs are image-scoped/);
+  assert.match(context, /Image Evidence Index:/);
+  assert.match(context, /image-1: before\.png; source=event\.images\[0]; mime=image\/png; bytes=111; citation_prefix=image-1\./);
+  assert.match(context, /image-2: after\.png; source=event\.images\[1]; mime=image\/png; bytes=222; citation_prefix=image-2\./);
+  assert.match(context, /image-1\.E1: A dark dashboard header is visible/);
+  assert.match(context, /image-1\.E2: A blue action button appears on the right/);
+  assert.match(context, /image-1\.U1: The small status text is not readable/);
+  assert.match(context, /image-1\.I1: The screen is likely a dashboard based on image-1\.E1 and image-1\.E2/);
+  assert.match(context, /image-2\.E1: A light dashboard header is visible/);
+  assert.match(context, /image-2\.E2: A green confirmation banner appears below the header/);
+  assert.match(context, /image-2\.N1: error banner \(scope=visible viewport; status=not visible\)/);
+  assert.match(context, /image-2\.I1: The workflow may have succeeded based on image-2\.E2 and image-2\.N1/);
+  assert.doesNotMatch(context, /- E1: A dark dashboard/);
+  assert.doesNotMatch(context, /based on E1 and E2/);
+});
+
+test('image preflight preserves already scoped cross-image evidence references', () => {
+  const context = internals.renderVisionContext({
+    config: { model: 'vision-provider/vision-large' },
+    images: [
+      {
+        label: 'image-1',
+        displayName: 'baseline.png',
+        origin: 'event.text[0]',
+        mediaType: 'image/png',
+        byteLength: 333,
+      },
+      {
+        label: 'image-2',
+        displayName: 'candidate.png',
+        origin: 'event.text[1]',
+        mediaType: 'image/png',
+        byteLength: 444,
+      },
+    ],
+    summaryImages: [
+      {
+        label: 'image-1',
+        observed_facts: ['image-1.E1: The baseline chart has a blue line.'],
+        inferences: ['image-1.I1: The candidate may differ because image-2.E1 shows a green line.'],
+      },
+      {
+        label: 'image-2',
+        observed_facts: ['image-2.E1: The candidate chart has a green line.'],
+        inferences: ['image-2.I1: This should be compared against image-1.E1.'],
+      },
+    ],
+  });
+
+  assert.match(context, /image-1\.E1: The baseline chart has a blue line/);
+  assert.match(context, /image-1\.I1: The candidate may differ because image-2\.E1 shows a green line/);
+  assert.match(context, /image-2\.E1: The candidate chart has a green line/);
+  assert.match(context, /image-2\.I1: This should be compared against image-1\.E1/);
+  assert.doesNotMatch(context, /image-1\.image-1\.E1/);
+  assert.doesNotMatch(context, /image-1\.image-2\.E1/);
+  assert.doesNotMatch(context, /image-2\.image-1\.E1/);
+  assert.doesNotMatch(context, /image-2\.image-2\.E1/);
+});
+
+test('image preflight preserves literal OCR evidence-like text while scoping citations', () => {
+  const context = internals.renderVisionContext({
+    config: { model: 'vision-provider/vision-large' },
+    images: [
+      {
+        label: 'image-1',
+        displayName: 'label.png',
+        origin: 'event.images[0]',
+        mediaType: 'image/png',
+        byteLength: 555,
+      },
+    ],
+    summaryImages: [
+      {
+        label: 'image-1',
+        visible_text: ['E1: Visible label literally reads "E2" and the status text says N1.'],
+        structured_content: [
+          { id: 'E2', observation: 'A table cell literally contains key E3.', evidence: 'E1,N1' },
+        ],
+        inferences: ['I1: The literal label is relevant based on E1 and E2.'],
+      },
+    ],
+  });
+
+  const visibleTextSection = context.split('Visible Text And Symbols:')[1].split('Structured Content And Data:')[0];
+  const structuredSection = context.split('Structured Content And Data:')[1].split('Domain-Specific Details:')[0];
+  const inferenceSection = context.split('Inferences And Context:')[1].split('Guardrails For Text-Only Model:')[0];
+  assert.match(visibleTextSection, /image-1\.E1: Visible label literally reads "E2" and the status text says N1\./);
+  assert.doesNotMatch(visibleTextSection, /image-1\.E2/);
+  assert.doesNotMatch(visibleTextSection, /image-1\.N1/);
+  assert.match(structuredSection, /image-1\.E2: A table cell literally contains key E3\. \(evidence=image-1\.E1,image-1\.N1\)/);
+  assert.doesNotMatch(structuredSection, /image-1\.E3/);
+  assert.match(inferenceSection, /image-1\.I1: The literal label is relevant based on image-1\.E1 and image-1\.E2/);
+});
+
+test('image preflight keeps partial summaries traceable and does not reuse mismatched labels', () => {
+  const context = internals.renderVisionContext({
+    config: { model: 'vision-provider/vision-large' },
+    images: [
+      {
+        label: 'image-1',
+        displayName: 'first.png',
+        origin: 'event.images[0]',
+        mediaType: 'image/png',
+        byteLength: 111,
+      },
+      {
+        label: 'image-2',
+        displayName: 'second.png',
+        origin: 'event.images[1]',
+        mediaType: 'image/png',
+        byteLength: 222,
+      },
+    ],
+    summaryImages: [
+      {
+        label: 'image-1',
+        observed_facts: ['E1: First image has a dark header.'],
+        inferences: ['I1: First image is the baseline based on E1.'],
+      },
+    ],
+  });
+
+  const observedSection = context.split('Observed Facts:')[1].split('Uncertainties And Limits:')[0];
+  assert.match(context, /Images analyzed: 2/);
+  assert.match(context, /Vision summaries returned: 1/);
+  assert.match(observedSection, /image-1 \(first\.png; image\/png; 111 bytes\)\n- image-1\.E1: First image has a dark header/);
+  assert.match(observedSection, /image-2 \(second\.png; image\/png; 222 bytes\)\n- No structured observed facts were returned\./);
+  assert.doesNotMatch(observedSection, /image-2\.E1: First image has a dark header/);
+});
+
+test('image preflight redacts skipped pasted image paths in transformed text', async () => {
+  const root = mkdtempSync(join(tmpdir(), 'stronk-pi-image-skipped-redact.'));
+  const notImagePath = join(root, 'not-image.png');
+  writeFileSync(notImagePath, 'not actually an image');
+  let called = false;
+
+  const result = await withEnv(allowingPromptHookEnv({ STRONK_PI_STATE_ROOT: join(root, '.stronk-pi') }), async () => internals.handleInput(
+    {
+      text: `Please inspect ${notImagePath}`,
+      model: 'neuralwatt/glm-5.2:xhigh',
+    },
+    {
+      cwd: root,
+      visionPreflight: async () => {
+        called = true;
+      },
+    },
+  ));
+
+  assert.equal(called, false);
+  assert.equal(result.action, 'transform');
+  assert.equal(result.text.includes(notImagePath), false);
+  assert.match(result.text, /\[event\.text\[0]; not-image\.png; skipped by Stronk Pi image vision preflight]/);
+  assert.match(result.text, /Skipped Images:\n- not-image\.png: unsupported MIME type image\/png/);
+});
+
+test('image preflight sanitizes path attachments before vision and downstream prompts', async () => {
+  const root = mkdtempSync(join(tmpdir(), 'stronk-pi-image-path-attachment.'));
+  const imagePath = writePng(root, 'attached.png');
+  const calls = [];
+
+  const result = await withEnv(allowingPromptHookEnv({ STRONK_PI_STATE_ROOT: join(root, '.stronk-pi') }), async () => internals.handleInput(
+    {
+      text: `Describe ${imagePath}`,
+      model: 'neuralwatt/glm-5.2:xhigh',
+      images: [{ path: imagePath }],
+    },
+    {
+      cwd: root,
+      visionPreflight: async (request) => {
+        calls.push(request);
+        return {
+          images: [{
+            label: 'image-1',
+            observed_facts: ['E1: The path attachment was analyzed.'],
+            inferences: ['I1: The image was routed through vision preflight based on E1.'],
+          }],
+        };
+      },
+    },
+  ));
+
+  assert.equal(result.action, 'transform');
+  assert.deepEqual(result.images, []);
+  assert.equal(result.text.includes(imagePath), false);
+  assert.equal(calls.length, 1);
+  assert.equal(calls[0].messages[0].content[0].text.includes(imagePath), false);
+  assert.equal(JSON.stringify(calls[0].images).includes(imagePath), false);
+  assert.equal(JSON.stringify(calls[0].images).includes('pathAliases'), false);
+  assert.match(calls[0].messages[0].content[0].text, /\[image-1; attached\.png; analyzed by Stronk Pi image vision preflight]/);
+  assert.match(result.text, /image-1\.E1: The path attachment was analyzed/);
+  assert.match(result.text, /image-1\.I1: The image was routed through vision preflight based on image-1\.E1/);
+});
+
+test('image preflight status messages are bounded and classify safe failure reasons', () => {
+  assert.equal(
+    internals.formatImagePreflightStatus({ phase: 'failed', reason: 'vision provider kimi-coding returned HTTP 401: Invalid Authentication', failureMode: 'soft' }),
+    'Image vision preflight failed: missing vision model credentials; using a failure note instead of raw images.',
+  );
+  assert.equal(
+    internals.formatImagePreflightStatus({ phase: 'complete', imageCount: 1, skippedCount: 2 }),
+    'Image vision preflight complete: analyzed 1 image; skipped 2 images.',
+  );
+  assert.equal(
+    internals.safeImagePreflightFailureReason('super secret provider body with /private/tmp/image.png'),
+    'vision provider request failed',
+  );
+});
+
+test('image preflight animated widget advances frames and disposes its timer', async () => {
+  let renders = 0;
+  const widgetFactory = internals.createImagePreflightWidget({ imageCount: 3 });
+  const widget = widgetFactory(
+    { requestRender: () => { renders += 1; } },
+    { fg: (_key, text) => text },
+  );
+
+  assert.match(widget.render(80).join('\n'), /^\| Analyzing 3 images with vision preflight$/);
+  await sleep(150);
+  assert.ok(renders > 0);
+  assert.match(widget.render(80).join('\n'), /Analyzing 3 images with vision preflight/);
+
+  widget.dispose();
+  const afterDispose = renders;
+  await sleep(150);
+  assert.equal(renders, afterDispose);
+});
+
+test('image preflight uses TUI status and animated widget during analysis and restores them', async () => {
+  const root = mkdtempSync(join(tmpdir(), 'stronk-pi-image-preflight-ui.'));
+  const imagePath = writePng(root);
+  const events = [];
+  let widget;
+
+  const ui = {
+    notify: (message, kind) => events.push(['notify', kind, message]),
+    setStatus: (key, text) => events.push(['status', key, text]),
+    setWidget: (key, content, options) => {
+      events.push(['widget', key, typeof content, options]);
+      if (typeof content === 'function') {
+        widget = content(
+          { requestRender: () => events.push(['widgetRender']) },
+          { fg: (_key, text) => text },
+        );
+      } else if (widget?.dispose) {
+        widget.dispose();
+        widget = undefined;
+      }
+    },
+  };
+
+  const result = await withEnv(allowingPromptHookEnv({ STRONK_PI_STATE_ROOT: join(root, '.stronk-pi') }), async () => (
+    internals.handleInput(
+      {
+        text: `What changed in ${imagePath}?`,
+        model: 'alibaba-coding/qwen3-coder-plus',
+      },
+      {
+        cwd: root,
+        mode: 'tui',
+        hasUI: true,
+        ui,
+        visionPreflight: async () => {
+          assert.match(widget.render(80).join('\n'), /Analyzing 1 image with vision preflight/);
+          return {
+            images: [{
+              label: 'image-1',
+              observed_facts: ['The UI loading indicator test image was analyzed.'],
+              inferences: ['The TUI feedback path is active.'],
+            }],
+          };
+        },
+      },
+    )
+  ));
+
+  assert.equal(result.action, 'transform');
+  assert.match(result.text, /The UI loading indicator test image was analyzed/);
+  assert.deepEqual(events.filter((event) => event[0] === 'notify'), [
+    ['notify', 'info', 'Stronk Pi detected 1 image for a text-only model; analyzing with vision preflight.'],
+    ['notify', 'info', 'Image vision preflight complete: analyzed 1 image.'],
+  ]);
+  assert.deepEqual(events.filter((event) => event[0] === 'status'), [
+    ['status', 'stronk-pi-image-vision-preflight', 'image vision: Analyzing 1 image with vision preflight'],
+    ['status', 'stronk-pi-image-vision-preflight', undefined],
+  ]);
+  assert.equal(events.some((event) => event[0] === 'widget' && event[2] === 'function'), true);
+  assert.equal(events.some((event) => event[0] === 'widget' && event[2] === 'undefined'), true);
+  assert.equal(widget, undefined);
+});
+
+test('image preflight does not mutate shared TUI working loader customization', () => {
+  const events = [];
+  const ui = {
+    notify: (message, kind) => events.push(['notify', kind, message]),
+    setStatus: (key, text) => events.push(['status', key, text]),
+    setWorkingMessage: (message) => events.push(['workingMessage', message]),
+    setWorkingIndicator: (options) => events.push(['workingIndicator', options]),
+    setWidget: (key, content, options) => events.push(['widget', key, typeof content, options]),
+  };
+
+  internals.notifyImagePreflightStatus(
+    { hasUI: true, mode: 'tui', ui },
+    { phase: 'analyzing', imageCount: 1 },
+  );
+  internals.notifyImagePreflightStatus(
+    { hasUI: true, mode: 'tui', ui },
+    { phase: 'failed', imageCount: 1, reason: 'mock vision outage', failureMode: 'soft' },
+  );
+
+  assert.deepEqual(events.filter((event) => event[0] === 'workingMessage'), []);
+  assert.deepEqual(events.filter((event) => event[0] === 'workingIndicator'), []);
+  assert.deepEqual(events.filter((event) => event[0] === 'status'), [
+    ['status', 'stronk-pi-image-vision-preflight', 'image vision: Analyzing 1 image with vision preflight'],
+    ['status', 'stronk-pi-image-vision-preflight', undefined],
+  ]);
+  assert.equal(events.some((event) => event[0] === 'widget' && event[2] === 'function'), true);
+  assert.equal(events.some((event) => event[0] === 'widget' && event[2] === 'undefined'), true);
+});
+
+test('image preflight avoids TUI-only widget factories in RPC mode', () => {
+  const events = [];
+  const ui = {
+    notify: (message, kind) => events.push(['notify', kind, message]),
+    setStatus: (key, text) => events.push(['status', key, text]),
+    setWorkingMessage: (message) => events.push(['workingMessage', message]),
+    setWorkingIndicator: (options) => events.push(['workingIndicator', options]),
+    setWidget: (key, content, options) => events.push(['widget', key, typeof content, options]),
+  };
+
+  internals.notifyImagePreflightStatus(
+    { hasUI: true, mode: 'rpc', ui },
+    { phase: 'analyzing', imageCount: 1 },
+  );
+  internals.notifyImagePreflightStatus(
+    { hasUI: true, mode: 'rpc', ui },
+    { phase: 'complete', imageCount: 1 },
+  );
+
+  assert.deepEqual(events, [
+    ['status', 'stronk-pi-image-vision-preflight', 'image vision: Analyzing 1 image with vision preflight'],
+    ['notify', 'info', 'Stronk Pi detected 1 image for a text-only model; analyzing with vision preflight.'],
+    ['status', 'stronk-pi-image-vision-preflight', undefined],
+    ['notify', 'info', 'Image vision preflight complete: analyzed 1 image.'],
+  ]);
+});
+
+test('image preflight rewrites duplicate path aliases for one analyzed image', async () => {
+  const root = mkdtempSync(join(tmpdir(), 'stronk-pi-image-aliases.'));
+  const imagePath = realpathSync(writePng(root));
+  const aliasPath = join(root, 'alias.png');
+  symlinkSync(imagePath, aliasPath);
+  const calls = [];
+
+  const result = await withEnv(allowingPromptHookEnv({ STRONK_PI_STATE_ROOT: join(root, '.stronk-pi') }), async () => (
+    internals.handleInput(
+      {
+        text: `Compare ${imagePath} with ${aliasPath}.`,
+        model: 'neuralwatt/glm-5.2:xhigh',
+      },
+      {
+        cwd: root,
+        visionPreflight: async (request) => {
+          calls.push(request);
+          return {
+            images: [{
+              label: 'image-1',
+              observed_facts: ['The aliased image is a test PNG.'],
+              inferences: ['Both paths refer to the same analyzed image.'],
+            }],
+          };
+        },
+      },
+    )
+  ));
+
+  assert.equal(result.action, 'transform');
+  const prefix = result.text.split('<stronk-pi-image-vision-preflight>')[0];
+  assert.equal(prefix.includes(imagePath), false);
+  assert.equal(prefix.includes(aliasPath), false);
+  assert.match(prefix, /\[image-1; .*; analyzed by Stronk Pi image vision preflight]/);
+  assert.equal(calls.length, 1);
+  assert.equal(calls[0].messages[0].content.filter((part) => part.type === 'image').length, 1);
+});
+
+test('image preflight normalizes fenced JSON vision responses', () => {
+  const summary = internals.normalizeVisionSummary({
+    content: [
+      {
+        type: 'text',
+        text: [
+          '```json',
+          '{"images":[{"label":"image-1","observed_facts":["A terminal screenshot is visible."],"inferences":["The screenshot likely shows a validation run."]}]}',
+          '```',
+        ].join('\n'),
+      },
+    ],
+  });
+
+  assert.equal(summary.length, 1);
+  assert.deepEqual(summary[0].observed_facts, ['A terminal screenshot is visible.']);
+  assert.deepEqual(summary[0].inferences, ['The screenshot likely shows a validation run.']);
+});
+
+test('image preflight keeps singular uncertainty separate from inference', () => {
+  const parsed = internals.normalizeVisionSummary({
+    content: [
+      {
+        type: 'text',
+        text: [
+          'Observed Facts:',
+          '- E1: A cropped product photo is visible.',
+          'Uncertainty:',
+          '- U1: The product label is unreadable.',
+          'Inference:',
+          '- I1: The product may be a packaged snack based on E1.',
+        ].join('\n'),
+      },
+    ],
+  });
+
+  assert.deepEqual(parsed[0].observed_facts, ['E1: A cropped product photo is visible.']);
+  assert.deepEqual(parsed[0].uncertainties, ['U1: The product label is unreadable.']);
+  assert.deepEqual(parsed[0].inferences, ['I1: The product may be a packaged snack based on E1.']);
+
+  const context = internals.renderVisionContext({
+    config: { model: 'vision-provider/vision-large' },
+    images: [
+      {
+        label: 'image-1',
+        displayName: 'product.png',
+        origin: 'event.images[0]',
+        mediaType: 'image/png',
+        byteLength: 4567,
+      },
+    ],
+    summaryImages: [
+      {
+        label: 'image-1',
+        uncertainty: 'U2: The small print on the package is too blurry to read.',
+        inference: 'I2: The package appears unopened based on visible seams.',
+      },
+    ],
+  });
+  const uncertaintySection = context.split('Uncertainties And Limits:')[1].split('Inferences And Context:')[0];
+  const inferenceSection = context.split('Inferences And Context:')[1].split('Guardrails For Text-Only Model:')[0];
+  assert.match(uncertaintySection, /U2: The small print on the package is too blurry to read/);
+  assert.doesNotMatch(inferenceSection, /U2:/);
+  assert.match(inferenceSection, /I2: The package appears unopened/);
+});
+
+test('image preflight can use a host-injected completion adapter', async () => {
+  const root = mkdtempSync(join(tmpdir(), 'stronk-pi-image-complete-adapter.'));
+  const calls = [];
+  const registry = {
+    find(provider, modelId) {
+      calls.push({ provider, modelId });
+      if (provider === 'kimi-coding' && modelId === 'kimi-for-coding') {
+        return { provider, id: modelId, name: `${provider}/${modelId}` };
+      }
+      return undefined;
+    },
+    async getApiKeyAndHeaders(model) {
+      return { headers: { 'x-test-model': model.name } };
+    },
+  };
+
+  const result = await withEnv(allowingPromptHookEnv({ STRONK_PI_STATE_ROOT: join(root, '.stronk-pi') }), async () => (
+    internals.handleInput(
+      {
+        text: 'Explain the attached image',
+        model: 'alibaba-coding/qwen3-coder-plus',
+        images: [{ source: { type: 'base64', mediaType: 'image/png', data: PNG_BASE64 } }],
+      },
+      {
+        cwd: root,
+        modelRegistry: registry,
+        complete: async (model, payload, options) => {
+          calls.push({ model, payload, options });
+          return {
+            text: JSON.stringify({
+              images: [
+                {
+                  label: 'image-1',
+                  observed_facts: ['The adapter received one image content part.'],
+                  inferences: ['The host completion path is wired.'],
+                },
+              ],
+            }),
+          };
+        },
+      },
+    )
+  ));
+
+  const completeCall = calls.find((call) => call.payload);
+  assert.equal(result.action, 'transform');
+  assert.deepEqual(result.images, []);
+  assert.equal(calls[0].provider, 'kimi-coding');
+  assert.equal(calls[0].modelId, 'kimi-for-coding');
+  assert.equal(completeCall.model.name, 'kimi-coding/kimi-for-coding');
+  assert.equal(completeCall.payload.messages[0].content.filter((part) => part.type === 'image').length, 1);
+  assert.equal(completeCall.options.headers['x-test-model'], 'kimi-coding/kimi-for-coding');
+  assert.match(result.text, /The adapter received one image content part/);
+});
+
+test('image preflight can call configured OpenAI-compatible vision provider without host adapter', async () => {
+  const root = mkdtempSync(join(tmpdir(), 'stronk-pi-image-provider-fallback.'));
+  const stateRoot = join(root, '.stronk-pi');
+  mkdirSync(join(stateRoot, 'agent'), { recursive: true });
+  mkdirSync(join(stateRoot, 'config'), { recursive: true });
+  writeFileSync(join(stateRoot, 'agent', 'models.json'), JSON.stringify({
+    providers: {
+      'kimi-coding': {
+        name: 'Kimi Coding',
+        api: 'openai-completions',
+        apiKey: '$KIMI_API_KEY',
+        baseUrl: 'https://vision.example/v1',
+        compat: {
+          maxTokensField: 'max_tokens',
+          supportsDeveloperRole: false,
+          supportsStore: false,
+        },
+        models: [
+          { id: 'kimi-for-coding', input: ['text', 'image'], maxTokens: 65536 },
+        ],
+      },
+      'alibaba-coding': {
+        models: [{ id: 'qwen3-coder-plus', input: ['text'] }],
+      },
+    },
+  }));
+  writeFileSync(join(stateRoot, 'config', 'defaults.toml'), [
+    '[image_preflight]',
+    'enabled = true',
+    'model = "kimi-coding/kimi-for-coding:xhigh"',
+    '',
+  ].join('\n'));
+  const linuxEtcPath = '/etc/passwd';
+  const linuxRootPath = '/root/.ssh/id_ed25519';
+  const rawGifDataUrl = `data:image/gif;base64,${TINY_GIF_BASE64}`;
+  const fetchFn = captureFetch({
+    choices: [
+      {
+        message: {
+          content: JSON.stringify({
+            images: [
+              {
+                label: 'image-1',
+                observed_facts: ['The configured provider received the image.'],
+                inferences: ['The direct provider fallback is wired.'],
+              },
+            ],
+          }),
+        },
+      },
+    ],
+  });
+
+  const result = await withEnv(allowingPromptHookEnv({
+    STRONK_PI_STATE_ROOT: stateRoot,
+    KIMI_API_KEY: 'test-kimi-generic-key',
+    KIMI_CODE_API_KEY: 'fallback-kimi-code-key',
+	  }), async () => internals.handleInput(
+	    {
+	      text: `What is in this image? Compare with ${linuxEtcPath}, ${linuxRootPath}, and ${rawGifDataUrl}.`,
+	      model: 'alibaba-coding/qwen3-coder-plus',
+	      images: [{ source: { type: 'base64', mediaType: 'image/png', data: PNG_BASE64 } }],
+    },
+    {
+      cwd: root,
+      fetch: fetchFn,
+    },
+  ));
+
+  assert.equal(result.action, 'transform');
+  assert.deepEqual(result.images, []);
+  assert.match(result.text, /The configured provider received the image/);
+  assert.equal(fetchFn.calls.length, 1);
+  assert.equal(fetchFn.calls[0].url, 'https://vision.example/v1/chat/completions');
+  assert.equal(fetchFn.calls[0].init.method, 'POST');
+  assert.equal(fetchFn.calls[0].init.headers.authorization, 'Bearer test-kimi-generic-key');
+  const payload = requestBody(fetchFn.calls[0]);
+  assert.equal(payload.model, 'kimi-for-coding');
+  assert.equal(payload.max_tokens, 4096);
+  assert.equal(payload.messages[0].role, 'system');
+  assert.equal(payload.messages[1].role, 'user');
+  assert.equal(payload.messages[1].content[0].type, 'text');
+  assert.equal(payload.messages[1].content[1].type, 'image_url');
+  assert.match(payload.messages[1].content[1].image_url.url, /^data:image\/png;base64,/);
+  assert.equal(payload.messages[1].content[0].text.includes(linuxEtcPath), false);
+  assert.equal(payload.messages[1].content[0].text.includes(linuxRootPath), false);
+  assert.equal(payload.messages[1].content[0].text.includes('.ssh'), false);
+  assert.doesNotMatch(payload.messages[1].content[0].text, /data:image\/gif;base64/);
+  assert.doesNotMatch(payload.messages[1].content[0].text, new RegExp(TINY_GIF_BASE64.slice(0, 16)));
+});
+
+test('image preflight max_output_tokens config reaches provider payload and clamps high values', async () => {
+  const root = mkdtempSync(join(tmpdir(), 'stronk-pi-image-output-tokens.'));
+  const stateRoot = join(root, '.stronk-pi');
+  mkdirSync(join(stateRoot, 'agent'), { recursive: true });
+  mkdirSync(join(stateRoot, 'config'), { recursive: true });
+  writeFileSync(join(stateRoot, 'agent', 'models.json'), JSON.stringify({
+    providers: {
+      'vision-provider': {
+        api: 'openai-completions',
+        apiKey: '$VISION_API_KEY',
+        baseUrl: 'https://vision.example/v1',
+        models: [
+          { id: 'vision-large', input: ['text', 'image'] },
+        ],
+      },
+    },
+  }));
+  writeFileSync(join(stateRoot, 'config', 'defaults.toml'), [
+    '[image_preflight]',
+    'enabled = true',
+    'model = "vision-provider/vision-large"',
+    'max_output_tokens = 12000',
+    '',
+  ].join('\n'));
+  const fetchFn = captureFetch({
+    choices: [{ message: { content: '{"images":[]}' } }],
+  });
+
+  await internals.buildImageVisionPreflight(
+    {
+      text: 'Describe the attached image',
+      model: 'neuralwatt/glm-5.2:xhigh',
+      images: [{ source: { type: 'base64', mediaType: 'image/png', data: PNG_BASE64 } }],
+    },
+    { cwd: root, fetch: fetchFn },
+    {
+      env: {
+        STRONK_PI_STATE_ROOT: stateRoot,
+        VISION_API_KEY: 'vision-test-key',
+      },
+      fetch: fetchFn,
+    },
+  );
+
+  assert.equal(fetchFn.calls.length, 1);
+  const payload = requestBody(fetchFn.calls[0]);
+  assert.equal(payload.model, 'vision-large');
+  assert.equal(payload.max_tokens, 8192);
+});
+
+test('image preflight max_output_tokens config reaches Anthropic payload and clamps low values', async () => {
+  const root = mkdtempSync(join(tmpdir(), 'stronk-pi-image-anthropic-output-tokens.'));
+  const stateRoot = join(root, '.stronk-pi');
+  mkdirSync(join(stateRoot, 'agent'), { recursive: true });
+  mkdirSync(join(stateRoot, 'config'), { recursive: true });
+  writeFileSync(join(stateRoot, 'agent', 'models.json'), JSON.stringify({
+    providers: {
+      'anthropic-vision': {
+        api: 'anthropic-messages',
+        apiKey: '$ANTHROPIC_VISION_API_KEY',
+        baseUrl: 'https://anthropic.example/v1',
+        models: [
+          { id: 'vision-sonnet', input: ['text', 'image'] },
+        ],
+      },
+    },
+  }));
+  writeFileSync(join(stateRoot, 'config', 'defaults.toml'), [
+    '[image_preflight]',
+    'enabled = true',
+    'model = "anthropic-vision/vision-sonnet"',
+    'max_output_tokens = 128',
+    '',
+  ].join('\n'));
+  const fetchFn = captureFetch({
+    content: [{ type: 'text', text: '{"images":[]}' }],
+  });
+
+  await internals.buildImageVisionPreflight(
+    {
+      text: 'Describe the attached image',
+      model: 'neuralwatt/glm-5.2:xhigh',
+      images: [{ source: { type: 'base64', mediaType: 'image/png', data: PNG_BASE64 } }],
+    },
+    { cwd: root, fetch: fetchFn },
+    {
+      env: {
+        STRONK_PI_STATE_ROOT: stateRoot,
+        ANTHROPIC_VISION_API_KEY: 'anthropic-test-key',
+      },
+      fetch: fetchFn,
+    },
+  );
+
+  assert.equal(fetchFn.calls.length, 1);
+  assert.equal(fetchFn.calls[0].url, 'https://anthropic.example/v1/messages');
+  const payload = requestBody(fetchFn.calls[0]);
+  assert.equal(payload.model, 'vision-sonnet');
+  assert.equal(payload.max_tokens, 1024);
+});
+
+test('image preflight uses built-in Kimi coding fallback when provider is not in models.json', async () => {
+  const root = mkdtempSync(join(tmpdir(), 'stronk-pi-image-builtin-kimi-fallback.'));
+  const stateRoot = join(root, '.stronk-pi');
+  mkdirSync(join(stateRoot, 'agent'), { recursive: true });
+  mkdirSync(join(stateRoot, 'config'), { recursive: true });
+  writeFileSync(join(stateRoot, 'agent', 'models.json'), JSON.stringify({
+    providers: {
+      'alibaba-coding': {
+        models: [{ id: 'qwen3-coder-plus', input: ['text'] }],
+      },
+    },
+  }));
+  writeFileSync(join(stateRoot, 'config', 'defaults.toml'), [
+    '[image_preflight]',
+    'enabled = true',
+    'model = "kimi-coding/kimi-for-coding:xhigh"',
+    '',
+  ].join('\n'));
+  const fetchFn = captureFetch({
+    content: [
+      {
+        type: 'text',
+        text: JSON.stringify({
+          images: [
+            {
+              label: 'image-1',
+              observed_facts: ['The built-in Kimi fallback received the image.'],
+              inferences: ['The built-in provider contract is wired.'],
+            },
+          ],
+        }),
+      },
+    ],
+  });
+
+  const result = await withEnv(allowingPromptHookEnv({
+    STRONK_PI_STATE_ROOT: stateRoot,
+    KIMI_API_KEY: 'test-kimi-generic-key',
+    KIMI_CODE_API_KEY: 'fallback-kimi-code-key',
+  }), async () => internals.handleInput(
+    {
+      text: 'What is in this image?',
+      model: 'alibaba-coding/qwen3-coder-plus',
+      images: [{ source: { type: 'base64', mediaType: 'image/png', data: PNG_BASE64 } }],
+    },
+    {
+      cwd: root,
+      fetch: fetchFn,
+    },
+  ));
+
+  assert.equal(result.action, 'transform');
+  assert.deepEqual(result.images, []);
+  assert.match(result.text, /The built-in Kimi fallback received the image/);
+  assert.equal(fetchFn.calls.length, 1);
+  assert.equal(fetchFn.calls[0].url, 'https://api.kimi.com/coding/v1/messages');
+  assert.equal(fetchFn.calls[0].init.headers['x-api-key'], 'test-kimi-generic-key');
+  assert.equal(fetchFn.calls[0].init.headers['User-Agent'], 'KimiCLI/1.5');
+  const payload = requestBody(fetchFn.calls[0]);
+  assert.equal(payload.model, 'kimi-for-coding');
+  assert.equal(payload.max_tokens, 4096);
+  assert.equal(payload.stream, false);
+  assert.equal(payload.messages[0].content[1].type, 'image');
+  assert.equal(payload.messages[0].content[1].source.media_type, 'image/png');
+});
+
+test('image preflight reports missing Kimi credentials before provider request', async () => {
+  const root = mkdtempSync(join(tmpdir(), 'stronk-pi-image-missing-kimi-key.'));
+  const stateRoot = join(root, '.stronk-pi');
+  mkdirSync(join(stateRoot, 'agent'), { recursive: true });
+  mkdirSync(join(stateRoot, 'config'), { recursive: true });
+  writeFileSync(join(stateRoot, 'agent', 'models.json'), JSON.stringify({
+    providers: {
+      'kimi-coding': {
+        name: 'Kimi Coding',
+        api: 'openai-completions',
+        baseUrl: 'https://vision.example/v1',
+        models: [
+          { id: 'kimi-for-coding', input: ['text', 'image'], maxTokens: 65536 },
+        ],
+      },
+      'alibaba-coding': {
+        models: [{ id: 'qwen3-coder-plus', input: ['text'] }],
+      },
+    },
+  }));
+  writeFileSync(join(stateRoot, 'config', 'defaults.toml'), [
+    '[image_preflight]',
+    'enabled = true',
+    'model = "kimi-coding/kimi-for-coding:xhigh"',
+    '',
+  ].join('\n'));
+  const fetchFn = captureFetch({});
+
+  const result = await withEnv(allowingPromptHookEnv({
+    STRONK_PI_STATE_ROOT: stateRoot,
+    KIMI_API_KEY: '',
+    KIMI_CODE_API_KEY: '',
+  }), async () => internals.handleInput(
+    {
+      text: 'What is in this image?',
+      model: 'alibaba-coding/qwen3-coder-plus',
+      images: [{ source: { type: 'base64', mediaType: 'image/png', data: PNG_BASE64 } }],
+    },
+    {
+      cwd: root,
+      fetch: fetchFn,
+    },
+  ));
+
+  assert.equal(result.action, 'transform');
+  assert.match(result.text, /Preflight status: failed \(missing vision model credentials\)/);
+  assert.doesNotMatch(result.text, /KIMI_API_KEY|KIMI_CODE_API_KEY/);
+  assert.equal(fetchFn.calls.length, 0);
+});
+
+test('native multimodal models keep raw image handling and bypass preflight', async () => {
+  let called = false;
+  const notices = [];
+  const result = await withEnv(allowingPromptHookEnv(), async () => internals.handleInput(
+    {
+      text: 'Describe the attached image',
+      model: 'alibaba-coding/qwen3.6-plus',
+      images: [{ source: { type: 'base64', mediaType: 'image/png', data: PNG_BASE64 } }],
+    },
+    {
+      model: { id: 'qwen3.6-plus', provider: 'alibaba-coding', input: ['text', 'image'] },
+      hasUI: true,
+      ui: { notify: (message, kind) => notices.push([kind, message]) },
+      visionPreflight: async () => {
+        called = true;
+      },
+    },
+  ));
+
+  assert.equal(result, undefined);
+  assert.equal(called, false);
+  assert.deepEqual(notices, []);
+});
+
+test('built-in Kimi multimodal model keeps native raw image handling without provider config', async () => {
+  const root = mkdtempSync(join(tmpdir(), 'stronk-pi-image-builtin-kimi-native.'));
+  const stateRoot = join(root, '.stronk-pi');
+  mkdirSync(join(stateRoot, 'agent'), { recursive: true });
+  mkdirSync(join(stateRoot, 'config'), { recursive: true });
+  writeFileSync(join(stateRoot, 'agent', 'models.json'), JSON.stringify({
+    providers: {},
+  }));
+  writeFileSync(join(stateRoot, 'config', 'defaults.toml'), [
+    '[image_preflight]',
+    'enabled = true',
+    'model = "kimi-coding/kimi-for-coding:xhigh"',
+    '',
+  ].join('\n'));
+  let called = false;
+  const result = await withEnv(allowingPromptHookEnv({ STRONK_PI_STATE_ROOT: stateRoot }), async () => internals.handleInput(
+    {
+      text: 'Describe the attached image',
+      model: 'kimi-coding/kimi-for-coding:xhigh',
+      images: [{ source: { type: 'base64', mediaType: 'image/png', data: PNG_BASE64 } }],
+    },
+    {
+      cwd: root,
+      visionPreflight: async () => {
+        called = true;
+      },
+    },
+  ));
+
+  assert.equal(result, undefined);
+  assert.equal(called, false);
+});
+
+test('extension-originated image prompts are guarded against recursive preflight', async () => {
+  const root = mkdtempSync(join(tmpdir(), 'stronk-pi-image-recursion.'));
+  const imagePath = writePng(root);
+  let called = false;
+
+  const result = await withEnv(allowingPromptHookEnv(), async () => internals.handleInput(
+    {
+      text: `Analyze ${imagePath}`,
+      source: 'extension',
+      model: 'alibaba-coding/qwen3-coder-plus',
+    },
+    {
+      cwd: root,
+      visionPreflight: async () => {
+        called = true;
+      },
+    },
+  ));
+
+  assert.equal(result, undefined);
+  assert.equal(called, false);
+});
+
+test('image preflight enforces limits and reports skipped images', async () => {
+  const root = mkdtempSync(join(tmpdir(), 'stronk-pi-image-limits.'));
+  const first = writePng(root, 'first.png');
+  const second = writePng(root, 'second.png');
+  const notices = [];
+
+  const result = await withEnv(allowingPromptHookEnv({
+    STRONK_PI_IMAGE_PREFLIGHT_MAX_IMAGES: '1',
+    STRONK_PI_STATE_ROOT: join(root, '.stronk-pi'),
+  }), async () => internals.handleInput(
+    {
+      text: `Compare ${first} and ${second}`,
+      model: 'alibaba-coding/qwen3-coder-plus',
+    },
+    {
+      cwd: root,
+      hasUI: true,
+      ui: { notify: (message, kind) => notices.push([kind, message]) },
+      visionPreflight: async () => ({
+        images: [{ label: 'image-1', observed_facts: ['First image was analyzed.'], inferences: [] }],
+      }),
+    },
+  ));
+
+  assert.equal(result.action, 'transform');
+  assert.match(result.text, /Images analyzed: 1/);
+  assert.match(result.text, /Skipped Images:/);
+  assert.match(result.text, /max_images limit reached/);
+  assert.deepEqual(notices, [
+    ['info', 'Stronk Pi detected 1 image for a text-only model; analyzing with vision preflight.'],
+    ['info', 'Image vision preflight complete: analyzed 1 image; skipped 1 image.'],
+  ]);
+});
+
+test('image preflight skips the thirteenth supported image by default', async () => {
+  const root = mkdtempSync(join(tmpdir(), 'stronk-pi-image-thirteen.'));
+  const imagePaths = Array.from({ length: 13 }, (_value, index) => writePng(root, `candidate-${String(index + 1).padStart(2, '0')}.png`));
+  const calls = [];
+  const notices = [];
+
+  const result = await withEnv(allowingPromptHookEnv({
+    STRONK_PI_STATE_ROOT: join(root, '.stronk-pi'),
+  }), async () => internals.handleInput(
+    {
+      text: `Compare ${imagePaths.join(' ')}`,
+      model: 'alibaba-coding/qwen3-coder-plus',
+    },
+    {
+      cwd: root,
+      hasUI: true,
+      ui: { notify: (message, kind) => notices.push([kind, message]) },
+      visionPreflight: async (request) => {
+        calls.push(request);
+        return {
+          images: Array.from({ length: 12 }, (_value, index) => ({
+            label: `image-${index + 1}`,
+            observed_facts: [`Image ${index + 1} was analyzed.`],
+            inferences: [],
+          })),
+        };
+      },
+    },
+  ));
+
+  assert.equal(result.action, 'transform');
+  assert.equal(calls.length, 1);
+  assert.equal(calls[0].messages[0].content.filter((part) => part.type === 'image').length, 12);
+  assert.match(result.text, /Images analyzed: 12/);
+  assert.match(result.text, /Skipped Images:/);
+  assert.match(result.text, /max_images limit reached \(12\)/);
+  assert.doesNotMatch(result.text, /image attachment scan limit reached/);
+  assert.deepEqual(notices, [
+    ['info', 'Stronk Pi detected 12 images for a text-only model; analyzing with vision preflight.'],
+    ['info', 'Image vision preflight complete: analyzed 12 images; skipped 1 image.'],
+  ]);
+});
+
+test('image preflight enforces byte-size and MIME limits before vision calls', async () => {
+  const root = mkdtempSync(join(tmpdir(), 'stronk-pi-image-limit-details.'));
+  const textPath = join(root, 'not-image.png');
+  writeFileSync(textPath, 'this is not a png');
+  let called = false;
+  const notices = [];
+
+  const byteLimit = await withEnv(allowingPromptHookEnv({
+    STRONK_PI_IMAGE_PREFLIGHT_MAX_BYTES: '1024',
+    STRONK_PI_STATE_ROOT: join(root, '.stronk-pi'),
+  }), async () => internals.handleInput(
+    {
+      text: 'Analyze attached image',
+      model: 'alibaba-coding/qwen3-coder-plus',
+      images: [{ source: { type: 'base64', mediaType: 'image/png', data: Buffer.alloc(2048).toString('base64') } }],
+    },
+    {
+      cwd: root,
+      hasUI: true,
+      ui: { notify: (message, kind) => notices.push([kind, message]) },
+      visionPreflight: async () => {
+        called = true;
+      },
+    },
+  ));
+
+  assert.equal(called, false);
+  assert.equal(byteLimit.action, 'transform');
+  assert.deepEqual(byteLimit.images, []);
+  assert.match(byteLimit.text, /image exceeds max_bytes \(1024\)/);
+  assert.deepEqual(notices, [
+    ['warning', 'Image vision preflight skipped: no supported images found; skipped 1 image.'],
+  ]);
+
+  const mimeLimit = await withEnv(allowingPromptHookEnv({
+    STRONK_PI_STATE_ROOT: join(root, '.stronk-pi'),
+  }), async () => internals.handleInput(
+    {
+      text: `Analyze ${textPath}`,
+      model: 'alibaba-coding/qwen3-coder-plus',
+    },
+    {
+      cwd: root,
+      visionPreflight: async () => {
+        called = true;
+      },
+    },
+  ));
+
+  assert.equal(called, false);
+  assert.equal(mimeLimit.action, 'transform');
+  assert.match(mimeLimit.text, /unsupported MIME type image\/png|unsupported MIME type unknown/);
+});
+
+test('image preflight rejects oversize base64 before decode and bounds attachment scanning', async () => {
+  const root = mkdtempSync(join(tmpdir(), 'stronk-pi-image-resource-bounds.'));
+  let called = false;
+  const rawImages = Array.from({ length: 20 }, () => ({
+    source: {
+      type: 'base64',
+      mediaType: 'image/png',
+      data: `${PNG_BASE64}${'A'.repeat(4096)}`,
+    },
+  }));
+
+  const result = await withEnv(allowingPromptHookEnv({
+    STRONK_PI_IMAGE_PREFLIGHT_MAX_IMAGES: '1',
+    STRONK_PI_IMAGE_PREFLIGHT_MAX_BYTES: '1024',
+    STRONK_PI_STATE_ROOT: join(root, '.stronk-pi'),
+  }), async () => internals.handleInput(
+    {
+      text: 'Analyze many oversized images',
+      model: 'alibaba-coding/qwen3-coder-plus',
+      images: rawImages,
+    },
+    {
+      cwd: root,
+      visionPreflight: async () => {
+        called = true;
+      },
+    },
+  ));
+
+  assert.equal(called, false);
+  assert.equal(result.action, 'transform');
+  assert.deepEqual(result.images, []);
+  assert.match(result.text, /image exceeds max_bytes \(1024\)/);
+  assert.match(result.text, /image attachment scan limit reached \(2\)/);
+  assert.doesNotMatch(result.text, /event\.images\[19]/);
+});
+
+test('image preflight rejects spoofed and invalid base64 attachments before vision calls', async () => {
+  const root = mkdtempSync(join(tmpdir(), 'stronk-pi-image-spoofed-base64.'));
+  let called = false;
+
+  const spoofed = await withEnv(allowingPromptHookEnv({
+    STRONK_PI_STATE_ROOT: join(root, '.stronk-pi'),
+  }), async () => internals.handleInput(
+    {
+      text: 'Analyze attached spoofed image',
+      model: 'alibaba-coding/qwen3-coder-plus',
+      images: [{ source: { type: 'base64', mediaType: 'image/png', data: Buffer.from('not an image').toString('base64') } }],
+    },
+    {
+      cwd: root,
+      visionPreflight: async () => {
+        called = true;
+      },
+    },
+  ));
+
+  assert.equal(called, false);
+  assert.equal(spoofed.action, 'transform');
+  assert.deepEqual(spoofed.images, []);
+  assert.match(spoofed.text, /unsupported MIME type image\/png/);
+
+  const invalid = await withEnv(allowingPromptHookEnv({
+    STRONK_PI_STATE_ROOT: join(root, '.stronk-pi'),
+  }), async () => internals.handleInput(
+    {
+      text: 'Analyze invalid base64 image',
+      model: 'alibaba-coding/qwen3-coder-plus',
+      images: [{ source: { type: 'base64', mediaType: 'image/png', data: 'not valid base64!' } }],
+    },
+    {
+      cwd: root,
+      visionPreflight: async () => {
+        called = true;
+      },
+    },
+  ));
+
+  assert.equal(called, false);
+  assert.equal(invalid.action, 'transform');
+  assert.deepEqual(invalid.images, []);
+  assert.match(invalid.text, /invalid image base64/);
+});
+
+test('image preflight fail-soft strips raw images and injects failure context', async () => {
+  const root = mkdtempSync(join(tmpdir(), 'stronk-pi-image-failsoft.'));
+  const notices = [];
+
+  const result = await withEnv(allowingPromptHookEnv({ STRONK_PI_STATE_ROOT: join(root, '.stronk-pi') }), async () => (
+    internals.handleInput(
+      {
+        text: 'What is in this image?',
+        model: 'alibaba-coding/qwen3-coder-plus',
+        images: [{ source: { type: 'base64', mediaType: 'image/png', data: PNG_BASE64 } }],
+      },
+      {
+        cwd: root,
+        hasUI: true,
+        ui: { notify: (message, kind) => notices.push([kind, message]) },
+        visionPreflight: async () => {
+          throw new Error(`mock provider echoed data:image/png;base64,${PNG_BASE64}`);
+        },
+      },
+    )
+  ));
+
+  assert.equal(result.action, 'transform');
+  assert.deepEqual(result.images, []);
+  assert.match(result.text, /Preflight status: failed \(vision provider request failed\)/);
+  assert.match(result.text, /No structured observed facts were returned/);
+  assert.doesNotMatch(result.text, /data:image\/png;base64/);
+  assert.doesNotMatch(result.text, new RegExp(PNG_BASE64.slice(0, 24)));
+  assert.deepEqual(notices, [
+    ['info', 'Stronk Pi detected 1 image for a text-only model; analyzing with vision preflight.'],
+    ['warning', 'Image vision preflight failed: vision provider request failed; using a failure note instead of raw images.'],
+  ]);
+});
+
+test('image preflight block mode handles prompt on vision failure', async () => {
+  const root = mkdtempSync(join(tmpdir(), 'stronk-pi-image-block.'));
+  const notices = [];
+
+  const result = await withEnv(allowingPromptHookEnv({
+    STRONK_PI_IMAGE_PREFLIGHT_FAILURE_MODE: 'block',
+    STRONK_PI_STATE_ROOT: join(root, '.stronk-pi'),
+  }), async () => internals.handleInput(
+    {
+      text: 'What is in this image?',
+      model: 'alibaba-coding/qwen3-coder-plus',
+      images: [{ source: { type: 'base64', mediaType: 'image/png', data: PNG_BASE64 } }],
+    },
+    {
+      cwd: root,
+      hasUI: true,
+      ui: { notify: (message, kind) => notices.push([kind, message]) },
+      visionPreflight: async () => {
+        throw new Error('mock block failure');
+      },
+    },
+  ));
+
+  assert.deepEqual(result, { action: 'handled' });
+  assert.deepEqual(notices, [
+    ['info', 'Stronk Pi detected 1 image for a text-only model; analyzing with vision preflight.'],
+    ['warning', 'Image vision preflight failed: vision provider request failed.'],
+  ]);
+});
+
+test('image preflight timeout is bounded and reported fail-soft', async () => {
+  const root = mkdtempSync(join(tmpdir(), 'stronk-pi-image-timeout.'));
+
+  const result = await withEnv(allowingPromptHookEnv({
+    STRONK_PI_IMAGE_PREFLIGHT_TIMEOUT_MS: '1000',
+    STRONK_PI_STATE_ROOT: join(root, '.stronk-pi'),
+  }), async () => internals.handleInput(
+    {
+      text: 'What is in this image?',
+      model: 'alibaba-coding/qwen3-coder-plus',
+      images: [{ source: { type: 'base64', mediaType: 'image/png', data: PNG_BASE64 } }],
+    },
+    {
+      cwd: root,
+      visionPreflight: async () => new Promise(() => {}),
+    },
+  ));
+
+  assert.equal(result.action, 'transform');
+  assert.deepEqual(result.images, []);
+  assert.match(result.text, /Preflight status: failed \(timed out\)/);
+});
+
 test('PostToolUse hook can mark Pi tool result as failed', async () => {
   const script = tempScript(`#!/usr/bin/env node
 process.stdin.resume();
@@ -3249,6 +5766,7 @@ test('managed plugin tools are allowed after helper approval', async () => {
       ['web_search', { query: 'Pi Coding Agent docs' }],
       ['code_search', { query: 'Pi Coding Agent tool implementation' }],
       ['fetch_content', { url: 'https://example.com' }],
+      ['image_read', { paths: ['screenshots/example.png'] }],
       ['ask_user', { question: 'Proceed?' }],
       ['question', { question: 'Proceed?' }],
       ['todowrite', { todos: [{ content: 'Track progress', status: 'pending' }] }],
