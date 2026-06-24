@@ -76,8 +76,8 @@ takes that name.
   search-result URLs alone, and do not run automatic background page-content
   fetches. Finished reviews label kept results as `fetched`, `fetch-failed`, or
   `snippet-only`; treat `snippet-only` as a prompt to fetch before citing.
-- `stronkpi` loads the installed plugin artifact at
-  `~/.stronk-pi/artifacts/stronk-pi-plugin-0.1.0/package/src/index.mjs`.
+- `stronkpi` loads the installed plugin artifact whose directory version
+  matches this repo's `package.json` version.
   After changing this repo's runtime tool surface, refresh the setup-managed
   artifact and verify `stronkpi --validate-only` plus `stronkpi --diagnose`.
 - `stronk_subagent` requires an explicit role manifest from the harness. The
@@ -100,3 +100,27 @@ Run checks:
 npm test
 npm run lint:security
 ```
+
+## Release Bump
+
+Prepare a plugin version bump in this repo:
+
+```bash
+npm run version:bump -- 0.2.0
+npm ci --ignore-scripts
+npm run check
+```
+
+After the bump PR is merged, publish the release from GitHub Actions:
+
+```bash
+gh workflow run release.yml --ref main -f version=0.2.0
+```
+
+The release workflow verifies that the workflow input matches `package.json`,
+packs the plugin, writes `BUILD-MANIFEST.json`, generates an attestation, and
+publishes the immutable `stronk-pi-plugin-v<version>` release.
+
+The `stronk-pi` distribution repo consumes that release in a separate PR.
+Agents can also use the project-scope `stronk-pi-plugin-release` skill in this
+repo.
