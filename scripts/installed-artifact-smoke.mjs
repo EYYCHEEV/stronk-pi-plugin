@@ -189,7 +189,7 @@ try {
   assert.equal(imageResult?.action, 'transform');
   assert.equal(visionCalls, 1);
   assert.match(imageResult.text, /<stronk-pi-image-vision-preflight>/);
-  assert.match(imageResult.text.split('<stronk-pi-image-vision-preflight>')[0], /\[image-1; pi-clipboard-smoke\.png; analyzed by Stronk Pi image vision preflight]/);
+  assert.match(imageResult.text.split('<stronk-pi-image-vision-preflight>')[0], /\[image-1; pi-clipboard-smoke\.png]/);
   assert.equal(imageResult.text.split('<stronk-pi-image-vision-preflight>')[0].includes(realImagePath), false);
   assert.match(imageResult.text, /Do not call file or image read tools/);
   assert.match(imageResult.text, /Installed artifact image preflight smoke observed the clipboard image/);
@@ -247,6 +247,10 @@ try {
   assert.equal(imageReadCalls[0].messages[0].content[0].text.includes(realImagePath), false);
   assert.equal(JSON.stringify(imageReadCalls[0].images).includes(realImagePath), false);
   assert.match(imageReadResult.content[0].text, /Image Read complete: analyzed 1 image/);
+  assert.match(imageReadResult.content[0].text, /<stronk-pi-image-read>/);
+  assert.match(imageReadResult.content[0].text, /<\/stronk-pi-image-read>/);
+  assert.doesNotMatch(imageReadResult.content[0].text, /<stronk-pi-image-vision-preflight>/);
+  assert.doesNotMatch(imageReadResult.content[0].text, /<\/stronk-pi-image-vision-preflight>/);
   assert.match(imageReadResult.content[0].text, /Image Evidence Index:/);
   assert.match(imageReadResult.content[0].text, /Installed artifact image_read smoke observed the screenshot/);
   assert.equal(imageReadResult.content[0].text.includes(realImagePath), false);
