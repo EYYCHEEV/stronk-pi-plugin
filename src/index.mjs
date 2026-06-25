@@ -1,10 +1,11 @@
 import { spawn } from 'node:child_process';
 import { randomUUID } from 'node:crypto';
-import { accessSync, closeSync, constants, openSync, readdirSync, readFileSync, readSync, realpathSync, statSync } from 'node:fs';
+import { accessSync, closeSync, constants, lstatSync, mkdirSync, opendirSync, openSync, readdirSync, readFileSync, readSync, realpathSync, statSync, unlinkSync, writeFileSync } from 'node:fs';
 import { createServer, request as httpRequest } from 'node:http';
 import { request as httpsRequest } from 'node:https';
 import { isIP } from 'node:net';
-import { basename, dirname, join, isAbsolute, relative, resolve } from 'node:path';
+import { basename, dirname, extname, join, isAbsolute, relative, resolve } from 'node:path';
+import { fileURLToPath } from 'node:url';
 import { createSubagentFacade, facadeAdapterMode, facadeEnabled, stronkSubagentSchema } from './subagents/facade.mjs';
 import { PiSubagentsBridgeAdapter } from './subagents/adapters/pi-subagents-bridge.mjs';
 
@@ -12,13 +13,16 @@ const SAFE_FETCH_TOOL = 'fetch_content';
 const WEB_SEARCH_TOOL = 'web_search';
 const CODE_SEARCH_TOOL = 'code_search';
 const STRONK_SUBAGENT_TOOL = 'stronk_subagent';
+const IMAGE_READ_TOOL = 'image_read';
+const IMAGE_PREFLIGHT_READ_TOOL = 'image_preflight_read';
 const DISABLED_PLUGIN_TOOLS = new Set(['get_search_content']);
 const WEB_TOOLS = new Set([WEB_SEARCH_TOOL, CODE_SEARCH_TOOL, SAFE_FETCH_TOOL]);
+const IMAGE_TOOLS = new Set([IMAGE_READ_TOOL, IMAGE_PREFLIGHT_READ_TOOL]);
 const SESSION_TOOLS = new Set(['todowrite', 'todoread', 'question', 'ask_user']);
 const INTERCOM_TOOLS = new Set(['intercom', 'contact_supervisor']);
 const READ_ONLY_TOOLS = new Set(['read', 'grep', 'find', 'ls', 'glob', 'todoread']);
 const MUTATING_TOOLS = new Set(['bash', 'write', 'edit', 'patch', 'apply_patch', 'multi_edit']);
-const PLUGIN_TOOLS = new Set(['mcp', 'subagent', STRONK_SUBAGENT_TOOL, ...WEB_TOOLS, ...SESSION_TOOLS, ...INTERCOM_TOOLS]);
+const PLUGIN_TOOLS = new Set(['mcp', 'subagent', STRONK_SUBAGENT_TOOL, ...WEB_TOOLS, ...IMAGE_TOOLS, ...SESSION_TOOLS, ...INTERCOM_TOOLS]);
 const SEARCH_PROVIDERS = ['exa', 'brave', 'tavily', 'gemini'];
 const SEARCH_WORKFLOWS = ['auto', 'summary-review', 'none'];
 const SEARCH_WORKFLOW_SET = new Set(SEARCH_WORKFLOWS);
@@ -104,6 +108,7 @@ const SKILL_SCOPE_RANK = new Map([
 const RESUME_HINT_SESSION_ID_PATTERN = /^[A-Za-z0-9][A-Za-z0-9._:-]*$/;
 const registeredSkillAutocompleteUIs = new WeakSet();
 const interactiveResumeHintSessionManagers = new WeakSet();
+const imagePreflightArtifactIndex = new Map();
 const CODEX_HOOK_EVENTS = new Set([
   'SessionStart',
   'UserPromptSubmit',
@@ -115,6 +120,107 @@ const CODEX_HOOK_EVENTS = new Set([
 const CODEX_HOOK_FAIL_CLOSED_EVENTS = new Set(['UserPromptSubmit', 'PermissionRequest']);
 const CODEX_PERMISSION_ALLOW_DECISIONS = new Set(['allow', 'approve', 'approved', 'accept', 'accepted']);
 const CODEX_PERMISSION_BLOCK_DECISIONS = new Set(['block', 'deny', 'denied', 'reject', 'rejected', 'ask']);
+const IMAGE_PREFLIGHT_MARKER = 'Stronk Pi Image Vision Preflight';
+const IMAGE_PREFLIGHT_CONTEXT_TAG = 'stronk-pi-image-vision-preflight';
+const IMAGE_READ_MARKER = 'Stronk Pi Image Read';
+const IMAGE_READ_CONTEXT_TAG = 'stronk-pi-image-read';
+const DEFAULT_IMAGE_PREFLIGHT_MODEL = 'kimi-coding/kimi-for-coding:xhigh';
+const DEFAULT_IMAGE_PREFLIGHT_MAX_IMAGES = 12;
+const DEFAULT_IMAGE_PREFLIGHT_MAX_BYTES = 5 * 1024 * 1024;
+const DEFAULT_IMAGE_PREFLIGHT_TIMEOUT_MS = 360000;
+const DEFAULT_IMAGE_PREFLIGHT_FAILURE_MODE = 'soft';
+const DEFAULT_IMAGE_PREFLIGHT_RESPONSE_MAX_TOKENS = 4096;
+const MIN_IMAGE_PREFLIGHT_RESPONSE_MAX_TOKENS = 1024;
+const MAX_IMAGE_PREFLIGHT_RESPONSE_MAX_TOKENS = 8192;
+const MAX_IMAGE_PREFLIGHT_IMAGES = 12;
+const MAX_IMAGE_PREFLIGHT_REQUEST_MAX_TOKENS = DEFAULT_IMAGE_PREFLIGHT_RESPONSE_MAX_TOKENS * MAX_IMAGE_PREFLIGHT_IMAGES;
+const MAX_IMAGE_PREFLIGHT_BYTES = 20 * 1024 * 1024;
+const MAX_IMAGE_PREFLIGHT_TIMEOUT_MS = 360000;
+const DEFAULT_IMAGE_PREFLIGHT_STREAM_IDLE_TIMEOUT_MS = 60000;
+const MIN_IMAGE_PREFLIGHT_STREAM_IDLE_TIMEOUT_MS = 1000;
+const MAX_IMAGE_PREFLIGHT_STREAM_IDLE_TIMEOUT_MS = MAX_IMAGE_PREFLIGHT_TIMEOUT_MS;
+const MAX_IMAGE_PREFLIGHT_REQUEST_TEXT_CHARS = 6000;
+const MAX_IMAGE_PREFLIGHT_CONTEXT_TEXT_CHARS = 12000;
+const DEFAULT_IMAGE_PREFLIGHT_ARTIFACT_READ_CHARS = 20000;
+const MAX_IMAGE_PREFLIGHT_ARTIFACT_READ_CHARS = 60000;
+const IMAGE_PREFLIGHT_ARTIFACT_IMAGES_PER_HANDLE = 3;
+const IMAGE_PREFLIGHT_ARTIFACT_HANDLE_PATTERN = /^image-preflight-[A-Fa-f0-9-]{36}$/;
+const MAX_IMAGE_PATH_CANDIDATES = 24;
+const MAX_IMAGE_PREFLIGHT_ATTACHMENT_SCAN = 24;
+const MAX_IMAGE_READ_DIRECTORY_ENTRIES = 512;
+const MAX_IMAGE_READ_DIRECTORY_DIRS = 64;
+const MAX_IMAGE_READ_SKIPPED_DETAILS = 24;
+const MAX_IMAGE_READ_OUTPUT_CHARS = 14000;
+const IMAGE_PREFLIGHT_UI_KEY = 'stronk-pi-image-vision-preflight';
+const IMAGE_PREFLIGHT_UI_FRAMES = ['|', '/', '-', '\\'];
+const IMAGE_PREFLIGHT_UI_INTERVAL_MS = 120;
+const IMAGE_PREFLIGHT_FAILURE_MODES = new Set(['soft', 'block']);
+const IMAGE_PREFLIGHT_THINKING_SUFFIXES = new Set(['xhigh', 'high', 'medium', 'low', 'minimal', 'none', 'off']);
+const OPENAI_COMPATIBLE_APIS = new Set(['openai', 'openai-chat-completions', 'openai-completions', 'chat-completions']);
+const ANTHROPIC_MESSAGES_APIS = new Set(['anthropic', 'anthropic-messages', 'messages']);
+const SUPPORTED_IMAGE_MIME_TYPES = new Set(['image/png', 'image/jpeg', 'image/gif', 'image/webp']);
+const IMAGE_EXTENSION_MIME_TYPES = new Map([
+  ['.png', 'image/png'],
+  ['.jpg', 'image/jpeg'],
+  ['.jpeg', 'image/jpeg'],
+  ['.gif', 'image/gif'],
+  ['.webp', 'image/webp'],
+]);
+const IMAGE_DATA_URL_PREFIX_PATTERN = /data:image\/[A-Za-z0-9.+-]+;base64,/gi;
+const BASE64_TOKEN_PATTERN = /[A-Za-z0-9+/_-]{8,}={0,2}/g;
+const LOCAL_PATH_BOUNDARY = "(^|[\\s\"'`([{<])";
+const LOCAL_IMAGE_PATH_WITH_SPACES_PATTERN = new RegExp(
+  LOCAL_PATH_BOUNDARY + "((?:file:\\/\\/|\\/(?!\\/)|~\\/|[A-Za-z]:[\\\\/])[^\"'`<>\\n)]*?\\.(?:png|jpe?g|gif|webp)\\b)",
+  'gi',
+);
+const QUOTED_LOCAL_PATH_TEXT_PATTERN = /(["'`])((?:file:\/\/|\/(?!\/)|~\/|[A-Za-z]:[\\/])[^"'`\n<>]+)\1/g;
+const LOCAL_PATH_TEXT_PATTERN = new RegExp(
+  LOCAL_PATH_BOUNDARY + "((?:file:\\/\\/[^\\s\"'`<>)]*|\\/(?!\\/)[^\\s\"'`<>)]*|~\\/[^\\s\"'`<>)]*|[A-Za-z]:[\\\\/][^\\s\"'`<>)]*))",
+  'g',
+);
+const PROTECTED_LOCAL_PATH_SEGMENTS = new Set(['.ssh', '.gnupg', '.aws', '.env']);
+const FULL_DISK_IMAGE_READ_MODES = new Set([
+  'danger-full-access',
+  'full-access',
+  'full-yolo',
+  'full_yolo',
+  'yolo',
+  'unrestricted',
+  'no-sandbox',
+  'disabled',
+]);
+const AUTO_IMAGE_READ_MODES = new Set(['auto']);
+const RESTRICTED_IMAGE_READ_MODES = new Set([
+  'default',
+  'read-only',
+  'read_only',
+  'workspace-write',
+  'workspace_write',
+  'workspace',
+  'restricted',
+]);
+const BUILTIN_VISION_PROVIDER_FALLBACKS = {
+  'kimi-coding/kimi-for-coding': {
+    providerName: 'kimi-coding',
+    providerConfig: {
+      name: 'Kimi Coding',
+      api: 'anthropic-messages',
+      apiKey: '$KIMI_API_KEY',
+      baseUrl: 'https://api.kimi.com/coding',
+      headers: {
+        'User-Agent': 'KimiCLI/1.5',
+      },
+      compat: {
+        supportsDeveloperRole: false,
+      },
+    },
+    modelConfig: {
+      id: 'kimi-for-coding',
+      input: ['text', 'image'],
+      maxTokens: 65536,
+    },
+  },
+};
 
 const emptyObjectSchema = {
   type: 'object',
@@ -131,6 +237,60 @@ const globSchema = {
     path: { type: 'string', description: 'Optional directory inside the current project to search from.' },
     maxResults: { type: 'number', minimum: 1, maximum: 1000, description: 'Maximum results to return. Defaults to 200.' },
     includeHidden: { type: 'boolean', description: 'Include hidden files and directories. Defaults to false.' },
+  },
+};
+
+const imageReadSchema = {
+  type: 'object',
+  additionalProperties: false,
+  oneOf: [
+    { required: ['paths'], not: { required: ['directory'] } },
+    { required: ['directory'], not: { required: ['paths'] } },
+  ],
+  properties: {
+    paths: {
+      type: 'array',
+      minItems: 1,
+      maxItems: 1,
+      items: { type: 'string' },
+      description: 'Exactly one explicit local image file path discovered by tools such as ls, glob, or find.',
+    },
+    directory: {
+      type: 'string',
+      description: 'One local folder to scan for image files. The bounded scan must resolve exactly one image.',
+    },
+    recursive: {
+      type: 'boolean',
+      description: 'Recursively scan the directory. Defaults to false and remains bounded.',
+      default: false,
+    },
+    question: {
+      type: 'string',
+      description: 'Optional visual question or focus for the configured vision model.',
+    },
+  },
+};
+
+const imagePreflightReadSchema = {
+  type: 'object',
+  additionalProperties: false,
+  required: ['handle'],
+  properties: {
+    handle: {
+      type: 'string',
+      description: 'Opaque handle for a session-scoped prompt-time image preflight analysis artifact.',
+    },
+    offset: {
+      type: 'number',
+      minimum: 0,
+      description: 'Character offset for reading a later chunk. Defaults to 0.',
+    },
+    max_chars: {
+      type: 'number',
+      minimum: 1024,
+      maximum: MAX_IMAGE_PREFLIGHT_ARTIFACT_READ_CHARS,
+      description: 'Maximum characters to return. Defaults to 20000 and remains bounded.',
+    },
   },
 };
 
@@ -342,12 +502,13 @@ function hasBlockingSensitiveContent(value) {
   return hasBlockingSensitiveString(value);
 }
 
-function redact(value) {
-  if (Array.isArray(value)) return value.map(redact);
+function redact(value, options = {}) {
+  const maxLength = options.maxLength === undefined ? 2000 : options.maxLength;
+  if (Array.isArray(value)) return value.map((item) => redact(item, options));
   if (value && typeof value === 'object') {
     const out = {};
     for (const [key, item] of Object.entries(value)) {
-      out[key] = isSensitiveKey(key) ? '<redacted>' : redact(item);
+      out[key] = isSensitiveKey(key) ? '<redacted>' : redact(item, options);
     }
     return out;
   }
@@ -359,7 +520,9 @@ function redact(value) {
   text = text.replace(ASSIGNMENT_PATTERN, (match, prefix, keyOpen, key, keyClose, operator, valueOpen, _value, valueClose) => (
     isSensitiveKey(key) ? `${prefix}${keyOpen}${key}${keyClose}${operator}${valueOpen}<redacted>${valueClose}` : match
   ));
-  return text.length > 2000 ? `${text.slice(0, 2000)}...<truncated>` : text;
+  return Number.isFinite(maxLength) && maxLength >= 0 && text.length > maxLength
+    ? `${text.slice(0, maxLength)}...<truncated>`
+    : text;
 }
 
 function redactUrlForPreview(value) {
@@ -391,8 +554,8 @@ function metadataOnlyFetchDetails(value) {
   return redact(clean(value ?? {}));
 }
 
-function sanitizeExternalText(value) {
-  return sanitizeRenderText(String(redact(value ?? '')));
+function sanitizeExternalText(value, options = {}) {
+  return sanitizeRenderText(String(redact(value ?? '', options)));
 }
 
 function helperArgv(kind) {
@@ -507,6 +670,15 @@ function firstString(...values) {
   return undefined;
 }
 
+function firstPresent(...values) {
+  for (const value of values) {
+    if (value === undefined || value === null) continue;
+    if (typeof value === 'string' && !value.trim()) continue;
+    return value;
+  }
+  return undefined;
+}
+
 function nestedString(value, ...path) {
   let current = value;
   for (const key of path) {
@@ -514,6 +686,2838 @@ function nestedString(value, ...path) {
     current = current[key];
   }
   return typeof current === 'string' && current.trim() ? current.trim() : undefined;
+}
+
+function clampedInteger(value, fallback, min, max) {
+  const parsed = typeof value === 'number' ? value : Number.parseInt(String(value ?? ''), 10);
+  if (!Number.isFinite(parsed)) return fallback;
+  return Math.max(min, Math.min(max, Math.trunc(parsed)));
+}
+
+function parseBoolean(value, fallback = false) {
+  if (typeof value === 'boolean') return value;
+  if (typeof value !== 'string') return fallback;
+  const normalized = value.trim().toLowerCase();
+  if (['1', 'true', 'yes', 'on', 'enabled'].includes(normalized)) return true;
+  if (['0', 'false', 'no', 'off', 'disabled'].includes(normalized)) return false;
+  return fallback;
+}
+
+function parseTomlScalar(value) {
+  const trimmed = value.trim();
+  const quoted = trimmed.match(/^"((?:\\.|[^"\\])*)"$/) || trimmed.match(/^'([^']*)'$/);
+  if (quoted) {
+    return quoted[1].replace(/\\"/g, '"').replace(/\\\\/g, '\\');
+  }
+  if (/^(true|false)$/i.test(trimmed)) return trimmed.toLowerCase() === 'true';
+  if (/^[+-]?\d+$/.test(trimmed)) return Number.parseInt(trimmed, 10);
+  return trimmed;
+}
+
+function stripTomlInlineComment(line) {
+  let quote;
+  let escaped = false;
+  for (let index = 0; index < line.length; index += 1) {
+    const char = line[index];
+    if (quote === '"' && escaped) {
+      escaped = false;
+      continue;
+    }
+    if (quote === '"' && char === '\\') {
+      escaped = true;
+      continue;
+    }
+    if ((char === '"' || char === "'") && !quote) {
+      quote = char;
+      continue;
+    }
+    if (char === quote) {
+      quote = undefined;
+      continue;
+    }
+    if (char === '#' && !quote) return line.slice(0, index);
+  }
+  return line;
+}
+
+function parseTomlSections(text) {
+  const out = {};
+  let section = '';
+  for (const rawLine of String(text || '').split(/\r?\n/)) {
+    const line = stripTomlInlineComment(rawLine).trim();
+    if (!line) continue;
+    const sectionMatch = line.match(/^\[([A-Za-z0-9_.-]+)\]$/);
+    if (sectionMatch) {
+      section = sectionMatch[1];
+      out[section] ??= {};
+      continue;
+    }
+    const assignment = line.match(/^([A-Za-z0-9_-]+)\s*=\s*(.+)$/);
+    if (!assignment) continue;
+    const target = section ? (out[section] ??= {}) : out;
+    target[assignment[1]] = parseTomlScalar(assignment[2]);
+  }
+  return out;
+}
+
+function readTomlSections(path) {
+  try {
+    return parseTomlSections(readFileSync(path, 'utf8'));
+  } catch {
+    return {};
+  }
+}
+
+function homeDirFromEnv(env = process.env) {
+  return firstString(env.HOME, env.USERPROFILE) || process.cwd();
+}
+
+function expandHomePath(value, env = process.env) {
+  const raw = String(value || '');
+  if (raw === '~') return homeDirFromEnv(env);
+  if (raw.startsWith('~/')) return join(homeDirFromEnv(env), raw.slice(2));
+  return raw;
+}
+
+function stronkStateRoot(env = process.env) {
+  return resolve(expandHomePath(firstString(env.STRONK_PI_STATE_ROOT) || '~/.stronk-pi', env));
+}
+
+function normalizeFailureMode(value, fallback = DEFAULT_IMAGE_PREFLIGHT_FAILURE_MODE) {
+  const normalized = typeof value === 'string' ? value.trim().toLowerCase() : '';
+  return IMAGE_PREFLIGHT_FAILURE_MODES.has(normalized) ? normalized : fallback;
+}
+
+function resolveVisionPreflightConfig(options = {}) {
+  const env = options.env ?? process.env;
+  const stateRoot = options.stateRoot ? resolve(expandHomePath(options.stateRoot, env)) : stronkStateRoot(env);
+  const defaultsPath = options.defaultsPath ? resolve(expandHomePath(options.defaultsPath, env)) : join(stateRoot, 'config', 'defaults.toml');
+  const rolesPath = options.rolesPath ? resolve(expandHomePath(options.rolesPath, env)) : join(stateRoot, 'config', 'roles.toml');
+  const localRolesPath = options.localRolesPath ? resolve(expandHomePath(options.localRolesPath, env)) : join(stateRoot, 'config', 'roles.local.toml');
+  const defaults = options.defaultsToml ? parseTomlSections(options.defaultsToml) : readTomlSections(defaultsPath);
+  const roles = options.rolesToml ? parseTomlSections(options.rolesToml) : readTomlSections(rolesPath);
+  const localRoles = options.localRolesToml ? parseTomlSections(options.localRolesToml) : readTomlSections(localRolesPath);
+  const imageConfig = defaults.image_preflight || {};
+
+  return {
+    enabled: parseBoolean(
+      firstString(env.STRONK_PI_IMAGE_PREFLIGHT, env.STRONK_PI_IMAGE_PREFLIGHT_ENABLED) ?? imageConfig.enabled,
+      parseBoolean(imageConfig.enabled, true),
+    ),
+    model: firstString(
+      env.STRONK_PI_IMAGE_PREFLIGHT_MODEL,
+      localRoles.pi?.vision_model,
+      roles.pi?.vision_model,
+      imageConfig.model,
+      defaults.models?.vision,
+      DEFAULT_IMAGE_PREFLIGHT_MODEL,
+    ),
+    maxImages: clampedInteger(
+      firstString(env.STRONK_PI_IMAGE_PREFLIGHT_MAX_IMAGES) ?? imageConfig.max_images,
+      DEFAULT_IMAGE_PREFLIGHT_MAX_IMAGES,
+      1,
+      MAX_IMAGE_PREFLIGHT_IMAGES,
+    ),
+    maxBytes: clampedInteger(
+      firstString(env.STRONK_PI_IMAGE_PREFLIGHT_MAX_BYTES) ?? imageConfig.max_bytes,
+      DEFAULT_IMAGE_PREFLIGHT_MAX_BYTES,
+      1024,
+      MAX_IMAGE_PREFLIGHT_BYTES,
+    ),
+    timeoutMs: clampedInteger(
+      firstString(env.STRONK_PI_IMAGE_PREFLIGHT_TIMEOUT_MS) ?? imageConfig.timeout_ms,
+      DEFAULT_IMAGE_PREFLIGHT_TIMEOUT_MS,
+      1000,
+      MAX_IMAGE_PREFLIGHT_TIMEOUT_MS,
+    ),
+    streamIdleTimeoutMs: clampedInteger(
+      firstString(env.STRONK_PI_IMAGE_PREFLIGHT_STREAM_IDLE_TIMEOUT_MS) ?? imageConfig.stream_idle_timeout_ms,
+      DEFAULT_IMAGE_PREFLIGHT_STREAM_IDLE_TIMEOUT_MS,
+      MIN_IMAGE_PREFLIGHT_STREAM_IDLE_TIMEOUT_MS,
+      MAX_IMAGE_PREFLIGHT_STREAM_IDLE_TIMEOUT_MS,
+    ),
+    maxOutputTokens: clampedInteger(
+      firstString(env.STRONK_PI_IMAGE_PREFLIGHT_MAX_OUTPUT_TOKENS) ?? imageConfig.max_output_tokens,
+      DEFAULT_IMAGE_PREFLIGHT_RESPONSE_MAX_TOKENS,
+      MIN_IMAGE_PREFLIGHT_RESPONSE_MAX_TOKENS,
+      MAX_IMAGE_PREFLIGHT_RESPONSE_MAX_TOKENS,
+    ),
+    failureMode: normalizeFailureMode(
+      firstString(env.STRONK_PI_IMAGE_PREFLIGHT_FAILURE_MODE) ?? imageConfig.failure_mode,
+      DEFAULT_IMAGE_PREFLIGHT_FAILURE_MODE,
+    ),
+    stateRoot,
+    defaultsPath,
+    rolesPath,
+    localRolesPath,
+    supportedMimeTypes: [...SUPPORTED_IMAGE_MIME_TYPES],
+  };
+}
+
+function stripModelThinkingSuffix(modelRef) {
+  const raw = String(modelRef || '').trim();
+  const separator = raw.lastIndexOf(':');
+  if (separator <= 0) return raw;
+  const suffix = raw.slice(separator + 1).toLowerCase();
+  if (!IMAGE_PREFLIGHT_THINKING_SUFFIXES.has(suffix)) return raw;
+  return raw.slice(0, separator);
+}
+
+function modelRefParts(modelRef) {
+  const stripped = stripModelThinkingSuffix(modelRef);
+  const slash = stripped.indexOf('/');
+  if (slash <= 0) return { modelId: stripped };
+  return { provider: stripped.slice(0, slash), modelId: stripped.slice(slash + 1), full: stripped };
+}
+
+function arrayHasImage(value) {
+  return Array.isArray(value) && value.some((item) => String(item).toLowerCase() === 'image');
+}
+
+function objectDeclaresImageInput(value) {
+  if (!value || typeof value !== 'object') return false;
+  if (value.supportsImages === true || value.supports_images === true || value.supportsImageInput === true) return true;
+  if (arrayHasImage(value.input) || arrayHasImage(value.inputs) || arrayHasImage(value.modalities)) return true;
+  if (objectDeclaresImageInput(value.capabilities) || objectDeclaresImageInput(value.compat)) return true;
+  return false;
+}
+
+function modelStringFrom(value) {
+  if (typeof value === 'string' && value.trim()) return value.trim();
+  if (!value || typeof value !== 'object') return undefined;
+  const id = firstString(value.id, value.model, value.modelId, value.model_id, value.slug, value.name);
+  const provider = firstString(value.provider, value.providerId, value.provider_id);
+  return provider && id && !id.startsWith(`${provider}/`) ? `${provider}/${id}` : id;
+}
+
+function modelRefsMatch(left, right) {
+  const a = modelRefParts(left);
+  const b = modelRefParts(right);
+  if (!a.modelId || !b.modelId) return false;
+  if (a.provider && b.provider) return a.provider === b.provider && a.modelId === b.modelId;
+  return a.modelId === b.modelId;
+}
+
+function activeModelRef(event = {}, ctx = {}) {
+  return firstString(
+    modelStringFrom(event.model),
+    event.model,
+    event.modelId,
+    event.model_id,
+    nestedString(event, 'model', 'id'),
+    nestedString(event, 'model', 'slug'),
+    modelStringFrom(ctx.model),
+    ctx.model,
+    ctx.modelId,
+    ctx.model_id,
+    nestedString(ctx, 'model', 'id'),
+    nestedString(ctx, 'model', 'slug'),
+    process.env.PI_MODEL,
+    process.env.STRONK_PI_MODEL,
+  );
+}
+
+function configuredModelSupportsImage(modelRef, modelsConfig = {}) {
+  if (!modelRef || !modelsConfig || typeof modelsConfig !== 'object') return false;
+  const parts = modelRefParts(modelRef);
+  const providers = modelsConfig.providers && typeof modelsConfig.providers === 'object' ? modelsConfig.providers : {};
+  for (const [providerName, providerConfig] of Object.entries(providers)) {
+    if (!providerConfig || typeof providerConfig !== 'object') continue;
+    const models = Array.isArray(providerConfig.models) ? providerConfig.models : [];
+    for (const model of models) {
+      if (!model || typeof model !== 'object') continue;
+      const id = firstString(model.id, model.model, model.name);
+      if (!id) continue;
+      const full = `${providerName}/${id}`;
+      const matches = modelRef === id
+        || stripModelThinkingSuffix(modelRef) === id
+        || stripModelThinkingSuffix(modelRef) === full
+        || (parts.provider === providerName && parts.modelId === id);
+      if (matches && objectDeclaresImageInput(model)) return true;
+    }
+  }
+  return false;
+}
+
+function builtinModelSupportsImage(modelRef) {
+  const parts = modelRefParts(modelRef);
+  const fallback = builtinVisionProviderFallback(parts);
+  return objectDeclaresImageInput(fallback?.modelConfig);
+}
+
+function loadModelsConfig(options = {}) {
+  if (options.modelsConfig && typeof options.modelsConfig === 'object') return options.modelsConfig;
+  if (typeof options.modelsJson === 'string') {
+    try {
+      return JSON.parse(options.modelsJson);
+    } catch {
+      return {};
+    }
+  }
+  const env = options.env ?? process.env;
+  const path = firstString(env.STRONK_PI_MODELS_JSON)
+    ? resolve(expandHomePath(env.STRONK_PI_MODELS_JSON, env))
+    : join(stronkStateRoot(env), 'agent', 'models.json');
+  try {
+    return JSON.parse(readFileSync(path, 'utf8'));
+  } catch {
+    return {};
+  }
+}
+
+function providerModels(providerConfig = {}) {
+  const models = providerConfig && typeof providerConfig === 'object' ? providerConfig.models : undefined;
+  if (Array.isArray(models)) return models.filter((model) => model && typeof model === 'object');
+  if (models && typeof models === 'object') {
+    return Object.entries(models)
+      .map(([id, model]) => (model && typeof model === 'object' ? { id, ...model } : { id }))
+      .filter((model) => model && typeof model === 'object');
+  }
+  return [];
+}
+
+function modelIdFromConfig(modelConfig = {}) {
+  return firstString(modelConfig.id, modelConfig.model, modelConfig.slug);
+}
+
+function providerModelMatches(providerName, modelConfig, parts) {
+  const modelId = modelIdFromConfig(modelConfig);
+  if (!providerName || !modelId || !parts?.modelId) return false;
+  return modelRefsMatch(`${providerName}/${modelId}`, parts.full || parts.modelId)
+    || modelRefsMatch(modelId, parts.modelId);
+}
+
+function builtinVisionProviderFallback(parts = {}) {
+  const key = parts.full || (parts.provider && parts.modelId ? `${parts.provider}/${parts.modelId}` : '');
+  const fallback = BUILTIN_VISION_PROVIDER_FALLBACKS[key];
+  if (!fallback) return undefined;
+  return {
+    ...fallback,
+    builtin: true,
+    modelId: modelIdFromConfig(fallback.modelConfig) || parts.modelId,
+  };
+}
+
+function resolveVisionProviderConfig(modelRef, options = {}) {
+  const parts = modelRefParts(modelRef);
+  if (!parts.provider || !parts.modelId) return undefined;
+  const providers = loadModelsConfig(options).providers;
+  const providerConfig = providers && typeof providers === 'object' ? providers[parts.provider] : undefined;
+  if (!providerConfig || typeof providerConfig !== 'object') return builtinVisionProviderFallback(parts);
+  const modelConfig = providerModels(providerConfig).find((model) => providerModelMatches(parts.provider, model, parts));
+  if (!modelConfig) return builtinVisionProviderFallback(parts);
+  return {
+    providerName: parts.provider,
+    providerConfig,
+    modelConfig,
+    modelId: modelIdFromConfig(modelConfig) || parts.modelId,
+    builtin: false,
+  };
+}
+
+function modelSupportsImageInput(event = {}, ctx = {}, options = {}) {
+  const modelRef = activeModelRef(event, ctx);
+  for (const candidate of [event.model, event.modelInfo, event.activeModel, ctx.model, ctx.modelInfo, ctx.activeModel]) {
+    if (!objectDeclaresImageInput(candidate)) continue;
+    const candidateRef = modelStringFrom(candidate);
+    if (!modelRef) return true;
+    if (candidateRef && modelRefsMatch(modelRef, candidateRef)) return true;
+  }
+  if (!modelRef) return false;
+  return configuredModelSupportsImage(modelRef, loadModelsConfig(options)) || builtinModelSupportsImage(modelRef);
+}
+
+function normalizeImageMime(value) {
+  const normalized = typeof value === 'string' ? value.trim().toLowerCase() : '';
+  if (!normalized) return undefined;
+  if (normalized === 'image/jpg') return 'image/jpeg';
+  if (SUPPORTED_IMAGE_MIME_TYPES.has(normalized)) return normalized;
+  return normalized.startsWith('image/') ? normalized : undefined;
+}
+
+function mimeFromPath(path) {
+  return IMAGE_EXTENSION_MIME_TYPES.get(extname(path || '').toLowerCase());
+}
+
+function hasSupportedImageExtension(path) {
+  return imageMimeSupported(mimeFromPath(path));
+}
+
+function mimeFromMagic(buffer) {
+  if (!buffer || buffer.length < 4) return undefined;
+  if (buffer.length >= 8 && buffer.subarray(0, 8).equals(Buffer.from([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a]))) return 'image/png';
+  if (buffer[0] === 0xff && buffer[1] === 0xd8 && buffer[2] === 0xff) return 'image/jpeg';
+  if (buffer.subarray(0, 6).toString('ascii') === 'GIF87a' || buffer.subarray(0, 6).toString('ascii') === 'GIF89a') return 'image/gif';
+  if (buffer.length >= 12 && buffer.subarray(0, 4).toString('ascii') === 'RIFF' && buffer.subarray(8, 12).toString('ascii') === 'WEBP') return 'image/webp';
+  return undefined;
+}
+
+function imageMimeSupported(mimeType) {
+  return SUPPORTED_IMAGE_MIME_TYPES.has(normalizeImageMime(mimeType));
+}
+
+function parseDataUrl(value) {
+  const match = String(value || '').match(/^data:([^;,]+);base64,([A-Za-z0-9+/=\s_-]+)$/);
+  if (!match) return undefined;
+  return { mediaType: normalizeImageMime(match[1]), data: match[2].replace(/\s+/g, '') };
+}
+
+function decodeBase64ImageData(data) {
+  const normalized = String(data || '').replace(/\s+/g, '');
+  if (!normalized) return undefined;
+  if (normalized.length % 4 === 1 || !/^[A-Za-z0-9+/_-]+={0,2}$/.test(normalized)) return undefined;
+  try {
+    const buffer = Buffer.from(normalized.replace(/-/g, '+').replace(/_/g, '/'), 'base64');
+    if (buffer.byteLength <= 0) return undefined;
+    const roundTrip = buffer.toString('base64').replace(/=+$/g, '');
+    if (roundTrip !== normalized.replace(/=+$/g, '').replace(/-/g, '+').replace(/_/g, '/')) return undefined;
+    return { buffer, data: buffer.toString('base64') };
+  } catch {
+    return undefined;
+  }
+}
+
+function isSupportedBase64Image(data) {
+  const decoded = decodeBase64ImageData(data);
+  return Boolean(decoded && imageMimeSupported(mimeFromMagic(decoded.buffer)));
+}
+
+function imageBase64RawEnd(text, start) {
+  let normalized = '';
+  let lastGoodEnd = -1;
+  for (let index = start; index < text.length; index += 1) {
+    const ch = text[index];
+    if (/[A-Za-z0-9+/_=-]/.test(ch)) {
+      normalized += ch;
+      if (normalized.length >= 8 && normalized.length % 4 !== 1 && isSupportedBase64Image(normalized)) {
+        lastGoodEnd = index + 1;
+      }
+      continue;
+    }
+    if (/\s/.test(ch)) continue;
+    break;
+  }
+  return lastGoodEnd > start ? lastGoodEnd : start;
+}
+
+function redactImageDataUrls(text) {
+  const source = String(text || '');
+  let output = '';
+  let cursor = 0;
+  let match;
+  IMAGE_DATA_URL_PREFIX_PATTERN.lastIndex = 0;
+  while ((match = IMAGE_DATA_URL_PREFIX_PATTERN.exec(source)) !== null) {
+    const dataStart = IMAGE_DATA_URL_PREFIX_PATTERN.lastIndex;
+    const dataEnd = imageBase64RawEnd(source, dataStart);
+    if (dataEnd <= dataStart) continue;
+    output += source.slice(cursor, match.index);
+    output += '<redacted image data>';
+    cursor = dataEnd;
+    IMAGE_DATA_URL_PREFIX_PATTERN.lastIndex = dataEnd;
+  }
+  return cursor === 0 ? source : output + source.slice(cursor);
+}
+
+function redactImageBase64Tokens(text) {
+  return String(text || '').replace(BASE64_TOKEN_PATTERN, (match) => (
+    isSupportedBase64Image(match) ? '<redacted image data>' : match
+  ));
+}
+
+function redactImageDataText(text) {
+  return redactImageBase64Tokens(redactImageDataUrls(text));
+}
+
+function redactLocalPathText(text) {
+  const replaceBoundaryPath = (value, pattern) => value.replace(pattern, (_match, prefix) => `${prefix}<redacted local path>`);
+  let output = String(text || '').replace(QUOTED_LOCAL_PATH_TEXT_PATTERN, '<redacted local path>');
+  output = replaceBoundaryPath(output, LOCAL_IMAGE_PATH_WITH_SPACES_PATTERN);
+  return replaceBoundaryPath(output, LOCAL_PATH_TEXT_PATTERN);
+}
+
+function base64EncodedMaxLength(byteLimit) {
+  return Math.ceil(Math.max(0, Number(byteLimit) || 0) / 3) * 4;
+}
+
+function imagePathAllowed(path, cwd, env = process.env) {
+  const home = resolve(homeDirFromEnv(env));
+  const roots = [
+    cwd,
+    home,
+    firstString(env.TMPDIR) ? resolve(env.TMPDIR) : undefined,
+    '/tmp',
+    '/private/tmp',
+    '/var/folders',
+    '/private/var/folders',
+  ].filter(Boolean).map((root) => {
+    try {
+      return realpathSync(root);
+    } catch {
+      return resolve(root);
+    }
+  });
+  return roots.some((root) => {
+    const rel = relative(root, path);
+    return rel === '' || (!rel.startsWith('..') && !isAbsolute(rel));
+  });
+}
+
+function normalizeImagePermissionModes(values = []) {
+  return values
+    .filter((value) => typeof value === 'string' && value.trim())
+    .map((mode) => String(mode).trim().toLowerCase());
+}
+
+function imagePermissionContextCandidates(ctx = {}) {
+  return [
+    ctx.sandboxMode,
+    ctx.sandbox_mode,
+    ctx.permissionMode,
+    ctx.permission_mode,
+  ];
+}
+
+function imagePermissionEnvCandidates(env = process.env) {
+  return [
+    env.STRONK_PI_SANDBOX_MODE,
+    env.PI_SANDBOX_MODE,
+    env.CODEX_SANDBOX_MODE,
+    env.STRONK_PI_PERMISSION_MODE,
+    env.PI_PERMISSION_MODE,
+  ];
+}
+
+function imageAllowedRootPolicy(ctx = {}, env = process.env) {
+  const contextModes = normalizeImagePermissionModes(imagePermissionContextCandidates(ctx));
+  const envModes = normalizeImagePermissionModes(imagePermissionEnvCandidates(env));
+  const allModes = contextModes.concat(envModes);
+  if (allModes.some((mode) => FULL_DISK_IMAGE_READ_MODES.has(mode))) return false;
+  if (contextModes.some((mode) => AUTO_IMAGE_READ_MODES.has(mode))) return false;
+  if (contextModes.some((mode) => RESTRICTED_IMAGE_READ_MODES.has(mode))) return true;
+  if (envModes.some((mode) => AUTO_IMAGE_READ_MODES.has(mode))) return false;
+  if (envModes.some((mode) => RESTRICTED_IMAGE_READ_MODES.has(mode))) return true;
+  return false;
+}
+
+function imageReadShouldEnforceAllowedRoots(ctx = {}, env = process.env) {
+  return imageAllowedRootPolicy(ctx, env);
+}
+
+function imagePreflightShouldEnforceAllowedRoots(event = {}, ctx = {}, env = process.env) {
+  return imageAllowedRootPolicy({
+    sandboxMode: firstString(event.sandboxMode, event.sandbox_mode, ctx.sandboxMode, ctx.sandbox_mode),
+    permissionMode: firstString(event.permissionMode, event.permission_mode, ctx.permissionMode, ctx.permission_mode),
+  }, env);
+}
+
+function pathHasProtectedSegment(path) {
+  return String(path || '').split(/[\\/]+/).some((segment) => PROTECTED_LOCAL_PATH_SEGMENTS.has(segment));
+}
+
+function pathHasHiddenSegment(path) {
+  return String(path || '').split(/[\\/]+/).some((segment) => (
+    segment && segment !== '.' && segment !== '..' && segment.startsWith('.')
+  ));
+}
+
+function pathIsWithinRoot(root, target) {
+  const rel = relative(root, target);
+  return rel === '' || (!rel.startsWith('..') && !isAbsolute(rel));
+}
+
+function imageCandidateHasHiddenSegment(path, cwd) {
+  const root = resolve(cwd || process.cwd());
+  const target = resolve(path || '');
+  const roots = [root];
+  try {
+    const realRoot = realpathSync(root);
+    if (!roots.includes(realRoot)) roots.push(realRoot);
+  } catch {
+    // Use the logical root when the root itself cannot be resolved.
+  }
+  for (const candidateRoot of roots) {
+    if (pathIsWithinRoot(candidateRoot, target)) {
+      return pathHasHiddenSegment(relative(candidateRoot, target));
+    }
+  }
+  return pathHasHiddenSegment(target);
+}
+
+function cleanPathCandidate(raw) {
+  let value = String(raw || '').trim();
+  value = value.replace(/^<(.+)>$/, '$1');
+  value = value.replace(/^["'`](.+)["'`]$/, '$1');
+  value = value.replace(/[),.;:!?]+$/g, '');
+  return value.trim();
+}
+
+function resolveImagePathCandidate(raw, cwd, env = process.env) {
+  let value = cleanPathCandidate(raw);
+  if (!value) return undefined;
+  if (/^file:/i.test(value)) {
+    try {
+      value = fileURLToPath(value);
+    } catch {
+      return undefined;
+    }
+  }
+  value = expandHomePath(value, env);
+  return isAbsolute(value) ? resolve(value) : resolve(cwd, value);
+}
+
+function extractImagePathCandidates(text) {
+  const candidates = [];
+  const seen = new Set();
+  const add = (value) => {
+    const cleaned = cleanPathCandidate(value);
+    if (!cleaned || seen.has(cleaned)) return;
+    seen.add(cleaned);
+    candidates.push(cleaned);
+  };
+  const patterns = [
+    /!\[[^\]]*]\(([^)\n]+\.(?:png|jpe?g|gif|webp))(?:\s+"[^"]*")?\)/gi,
+    /\[[^\]]+]\(([^)\n]+\.(?:png|jpe?g|gif|webp))(?:\s+"[^"]*")?\)/gi,
+    /\bfile:\/\/[^\s'"<>`]+?\.(?:png|jpe?g|gif|webp)\b/gi,
+    /["'`]([^"'`\n]+\.(?:png|jpe?g|gif|webp))["'`]/gi,
+    /(?:^|[\s([{<])((?:~\/|\.\.?\/|\/)[^\n"'`<>]*?\.(?:png|jpe?g|gif|webp))(?=$|[\s)\]}>.,;!?])/gi,
+  ];
+  for (const pattern of patterns) {
+    pattern.lastIndex = 0;
+    for (let match = pattern.exec(text || ''); match && candidates.length < MAX_IMAGE_PATH_CANDIDATES; match = pattern.exec(text || '')) {
+      add(match[1] || match[0]);
+    }
+  }
+  return candidates;
+}
+
+function makeImageSkip(origin, reason, source = {}) {
+  return {
+    label: source.label || origin,
+    origin,
+    reason,
+    displayName: source.displayName,
+    path: source.path,
+    originalPath: source.originalPath,
+    pathAliases: imagePathAliases(source),
+    mediaType: source.mediaType,
+  };
+}
+
+function imagePathAliases(image = {}) {
+  const aliases = [];
+  for (const value of [
+    image.originalPath,
+    image.path,
+    ...(Array.isArray(image.pathAliases) ? image.pathAliases : []),
+  ]) {
+    if (typeof value !== 'string') continue;
+    const trimmed = value.trim();
+    if (trimmed && !aliases.includes(trimmed)) aliases.push(trimmed);
+  }
+  return aliases;
+}
+
+function safeImageDisplayName(image = {}, fallback = 'image') {
+  const value = firstString(image.displayName, image.name, image.originalPath, image.path, image.label, image.origin, fallback) || fallback;
+  const cleaned = cleanPathCandidate(value);
+  if (!cleaned) return fallback;
+  return basename(cleaned) || cleaned || fallback;
+}
+
+function imageReferenceReplacement(image = {}, status = 'analyzed') {
+  const label = firstString(image.label, image.origin) || 'image';
+  const displayName = safeImageDisplayName(image, label);
+  const display = displayName && displayName !== label ? `; ${displayName}` : '';
+  if (status === 'skipped') return `[${label}${display}; skipped]`;
+  if (status === 'failed') return `[${label}${display}; failed]`;
+  return `[${label}${display}]`;
+}
+
+function rewriteImageReferenceAliases(text, entries = []) {
+  let rewritten = String(text || '');
+  const replacements = [];
+  for (const entry of entries) {
+    const paths = imagePathAliases(entry.image).sort((left, right) => right.length - left.length);
+    for (const path of paths) {
+      if (!path) continue;
+      replacements.push([path, entry.replacement]);
+    }
+  }
+  for (const [path, replacement] of replacements) {
+    rewritten = rewritten.split(path).join(replacement);
+  }
+  return rewritten;
+}
+
+function mergeImagePathAliases(target = {}, source = {}) {
+  const aliases = [...imagePathAliases(target), ...imagePathAliases(source)];
+  if (aliases.length > 0) target.pathAliases = [...new Set(aliases)];
+  if (!target.originalPath && source.originalPath) target.originalPath = source.originalPath;
+  return target;
+}
+
+function makeNormalizedImage(origin, data, mediaType, byteLength, source = {}) {
+  const label = source.label || `image-${source.index ?? 1}`;
+  const pathAliases = imagePathAliases(source);
+  return {
+    label,
+    origin,
+    displayName: source.displayName || source.path ? basename(source.displayName || source.path) : label,
+    path: source.path,
+    originalPath: source.originalPath,
+    pathAliases,
+    mediaType,
+    byteLength,
+    data,
+    contentPart: {
+      type: 'image',
+      source: { type: 'base64', mediaType, data },
+    },
+  };
+}
+
+function normalizeBase64Image(origin, source, config, index) {
+  const dataUrl = parseDataUrl(source.data);
+  const rawData = dataUrl?.data || String(source.data || '').replace(/\s+/g, '');
+  if (rawData.length > base64EncodedMaxLength(config.maxBytes)) {
+    return { skip: makeImageSkip(origin, `image exceeds max_bytes (${config.maxBytes})`, source) };
+  }
+  const decoded = decodeBase64ImageData(rawData);
+  if (!decoded) return { skip: makeImageSkip(origin, rawData ? 'invalid image base64' : 'missing image data', source) };
+  if (decoded.buffer.byteLength > config.maxBytes) return { skip: makeImageSkip(origin, `image exceeds max_bytes (${config.maxBytes})`, source) };
+
+  const declaredMimeType = normalizeImageMime(dataUrl?.mediaType || source.mediaType || mimeFromPath(source.path || source.displayName));
+  const detectedMimeType = mimeFromMagic(decoded.buffer);
+  if (!imageMimeSupported(detectedMimeType)) {
+    return { skip: makeImageSkip(origin, `unsupported MIME type ${declaredMimeType || detectedMimeType || 'unknown'}`, source) };
+  }
+  if (declaredMimeType && imageMimeSupported(declaredMimeType) && declaredMimeType !== detectedMimeType) {
+    return { skip: makeImageSkip(origin, `MIME mismatch declared ${declaredMimeType} but detected ${detectedMimeType}`, source) };
+  }
+  if (declaredMimeType && !imageMimeSupported(declaredMimeType)) {
+    return { skip: makeImageSkip(origin, `unsupported MIME type ${declaredMimeType}`, source) };
+  }
+  return { image: makeNormalizedImage(origin, decoded.data, detectedMimeType, decoded.buffer.byteLength, { ...source, index }) };
+}
+
+function normalizePathImage(origin, rawPath, config, index, ctx = {}, env = process.env, options = {}) {
+  const cwd = resolve(firstString(ctx.cwd) || process.cwd());
+  const originalPath = cleanPathCandidate(rawPath);
+  const path = resolveImagePathCandidate(rawPath, cwd, env);
+  const enforceAllowedRoots = options.enforceAllowedRoots !== false;
+  if (!path) return { skip: makeImageSkip(origin, 'invalid image path', { path: String(rawPath || ''), originalPath }) };
+  if (pathHasProtectedSegment(path) || pathHasProtectedSegment(originalPath)) {
+    return { skip: makeImageSkip(origin, 'protected local path denied', { path, originalPath }) };
+  }
+  if (imageCandidateHasHiddenSegment(path, cwd)) {
+    return { skip: makeImageSkip(origin, 'hidden path skipped', { path, originalPath }) };
+  }
+  let linkStats;
+  try {
+    linkStats = lstatSync(path);
+  } catch {
+    return { skip: makeImageSkip(origin, 'image path does not exist', { path, originalPath }) };
+  }
+  if (linkStats.isSymbolicLink()) {
+    return { skip: makeImageSkip(origin, 'symlink path skipped', { path, originalPath }) };
+  }
+  let realPath;
+  try {
+    realPath = realpathSync(path);
+  } catch {
+    return { skip: makeImageSkip(origin, 'image path does not exist', { path, originalPath }) };
+  }
+  if (pathHasProtectedSegment(realPath)) return { skip: makeImageSkip(origin, 'protected local path denied', { path: realPath, originalPath }) };
+  if (imageCandidateHasHiddenSegment(realPath, cwd)) return { skip: makeImageSkip(origin, 'hidden path skipped', { path: realPath, originalPath }) };
+  if (enforceAllowedRoots && !imagePathAllowed(realPath, cwd, env)) return { skip: makeImageSkip(origin, 'path outside allowed image roots', { path: realPath, originalPath }) };
+  let st;
+  try {
+    st = statSync(realPath);
+  } catch {
+    return { skip: makeImageSkip(origin, 'image path is not readable', { path: realPath, originalPath }) };
+  }
+  if (!st.isFile()) return { skip: makeImageSkip(origin, 'image path is not a file', { path: realPath, originalPath }) };
+  if (st.size > config.maxBytes) return { skip: makeImageSkip(origin, `image exceeds max_bytes (${config.maxBytes})`, { path: realPath, originalPath }) };
+  let buffer;
+  try {
+    buffer = readFileSync(realPath);
+  } catch {
+    return { skip: makeImageSkip(origin, 'image path is not readable', { path: realPath, originalPath }) };
+  }
+  const mediaType = mimeFromMagic(buffer);
+  if (!imageMimeSupported(mediaType)) {
+    return { skip: makeImageSkip(origin, `unsupported MIME type ${mimeFromPath(realPath) || mediaType || 'unknown'}`, { path: realPath, originalPath }) };
+  }
+  return {
+    image: makeNormalizedImage(origin, buffer.toString('base64'), mediaType, buffer.byteLength, {
+      index,
+      path: realPath,
+      originalPath,
+      displayName: basename(realPath),
+    }),
+  };
+}
+
+function sourceFromImageAttachment(raw) {
+  if (typeof raw === 'string') {
+    const dataUrl = parseDataUrl(raw);
+    return dataUrl ? { data: dataUrl.data, mediaType: dataUrl.mediaType } : { path: raw };
+  }
+  if (!raw || typeof raw !== 'object') return {};
+  const source = raw.source && typeof raw.source === 'object' ? raw.source : {};
+  const data = firstString(raw.data, raw.base64, raw.base64Data, source.data, source.base64);
+  const path = firstString(raw.path, raw.filePath, raw.file_path, raw.filename, raw.url, source.path, source.filePath, source.url);
+  const mediaType = normalizeImageMime(firstString(raw.mediaType, raw.mimeType, raw.mime, raw.type, source.mediaType, source.mimeType, source.mime));
+  return {
+    data,
+    path,
+    mediaType,
+    displayName: firstString(raw.name, raw.filename, raw.fileName, raw.file_name, path),
+  };
+}
+
+function collectImageInputs(event = {}, ctx = {}, config = resolveVisionPreflightConfig(), options = {}) {
+  const env = options.env ?? process.env;
+  const enforceAllowedRoots = imagePreflightShouldEnforceAllowedRoots(event, ctx, env);
+  const images = [];
+  const skipped = [];
+  const seen = new Map();
+  const addResult = (result) => {
+    if (result.image) {
+      const key = result.image.path ? `path:${result.image.path}` : `data:${result.image.mediaType}:${result.image.byteLength}:${result.image.data.slice(0, 32)}`;
+      const existing = seen.get(key);
+      if (existing) {
+        mergeImagePathAliases(existing, result.image);
+        return;
+      }
+      if (images.length >= config.maxImages) {
+        skipped.push(makeImageSkip(result.image.origin, `max_images limit reached (${config.maxImages})`, result.image));
+        return;
+      }
+      result.image.label = `image-${images.length + 1}`;
+      mergeImagePathAliases(result.image, result.image);
+      seen.set(key, result.image);
+      images.push(result.image);
+    } else if (result.skip) {
+      skipped.push(result.skip);
+    }
+  };
+
+  const rawImages = Array.isArray(event.images) ? event.images : [];
+  const imageScanLimit = Math.min(Math.max(config.maxImages * 2, config.maxImages + 1), MAX_IMAGE_PREFLIGHT_ATTACHMENT_SCAN);
+  const scannedRawImages = rawImages.slice(0, imageScanLimit);
+  for (const [index, raw] of scannedRawImages.entries()) {
+    const source = sourceFromImageAttachment(raw);
+    const origin = `event.images[${index}]`;
+    if (source.data) addResult(normalizeBase64Image(origin, source, config, index + 1));
+    else if (source.path) addResult(normalizePathImage(origin, source.path, config, index + 1, { cwd: firstString(event.cwd, ctx.cwd) }, env, { enforceAllowedRoots }));
+    else addResult({ skip: makeImageSkip(origin, 'unsupported image attachment shape', source) });
+  }
+  if (rawImages.length > imageScanLimit) {
+    skipped.push(makeImageSkip('event.images', `image attachment scan limit reached (${imageScanLimit})`, { label: 'event.images' }));
+  }
+
+  const text = typeof event.text === 'string' ? event.text : '';
+  for (const [index, candidate] of extractImagePathCandidates(text).entries()) {
+    addResult(normalizePathImage(`event.text[${index}]`, candidate, config, rawImages.length + index + 1, { cwd: firstString(event.cwd, ctx.cwd) }, env, { enforceAllowedRoots }));
+  }
+
+  return {
+    images,
+    skipped,
+    discoveredCount: rawImages.length + skipped.filter((item) => item.origin?.startsWith('event.text')).length + images.filter((item) => item.origin?.startsWith('event.text')).length,
+    rawImageCount: rawImages.length,
+  };
+}
+
+function truncateText(value, max = MAX_IMAGE_PREFLIGHT_REQUEST_TEXT_CHARS) {
+  const text = String(value || '').replace(/\u0000/g, '').trim();
+  return text.length > max ? `${text.slice(0, max - 24)}\n[truncated by Stronk Pi]` : text;
+}
+
+function visionSystemPrompt() {
+  return [
+    'You are Stronk Pi image vision preflight.',
+    'Turn any supplied image into evidence-rich context for a text-only coding agent.',
+    'Return JSON only. Do not wrap the JSON in Markdown.',
+    'Use this universal shape, filling only fields that are relevant to the image:',
+    '{"images":[{"label":"image-1","image_type":"photo|screenshot|document|chart|diagram|map|product|art|meme|mixed|unknown","overview":"one detailed sentence","quality_flags":["clear or limited"],"scene_and_composition":["image-1.E1: setting, background, foreground, viewpoint, lighting, style"],"subjects_and_entities":["image-1.E2: people, objects, products, places, visible named entities"],"attributes_and_state":["image-1.E3: colors, materials, condition, counts, measurements, state"],"spatial_relationships":["image-1.E4: positions, actions, interactions, movement, before/after relationship"],"visible_text":["image-1.E5: exact visible text, labels, captions, symbols"],"structured_content":["image-1.E6: tables, charts, diagrams, maps, forms, code, terminal output, UI, documents"],"domain_specific_details":["image-1.E7: relevant details for the detected image type"],"observed_facts":["image-1.E8: directly visible fact"],"uncertainties":["image-1.U1: unreadable, cropped, ambiguous, or low-confidence detail"],"negative_evidence":["image-1.N1: scoped not-visible result; do not treat as absent"],"inferences":["image-1.I1: inference citing image-1.E ids"],"guardrails":["how the text-only model should avoid overclaiming"]}]}',
+    'Use image-scoped evidence ids. Prefix direct observations with <label>.E#, uncertainties with <label>.U#, scoped negative evidence with <label>.N#, and inferences with <label>.I#.',
+    'Do not force every image into a UI or screenshot schema. First identify the image type, then describe what matters for that type.',
+    'For photos, preserve subjects, setting, composition, actions, relationships, state, visible text, and visual details such as color/material/condition.',
+    'For documents, screenshots, charts, diagrams, maps, code, or terminal images, preserve visible text, labels, values, layout, selected states, axes, legends, tables, errors, commands, and relationships.',
+    'Keep original UI labels or document text when legible; add short translations only when confident.',
+    'Include counts, measurements, identities, absence, density, condition, and relationships only when directly visible or clearly supported by cited evidence.',
+    'Never say something is absent or missing just because it is omitted, cropped, unreadable, not visible, or unknown.',
+    'Do not identify private people by name unless the image text explicitly names them. Do not infer sensitive traits.',
+    'Prefer up to 12 observed evidence items, 6 uncertainties, and 6 inferences per image. Keep each item short and specific.',
+    'Separate directly visible facts from inference. Do not invent hidden content, requirements, file metadata, off-screen UI, or unseen context.',
+  ].join('\n');
+}
+
+function imageVisionOutputTokens(config = {}, imageCount = 1) {
+  const perImage = clampedInteger(
+    config.maxOutputTokens,
+    DEFAULT_IMAGE_PREFLIGHT_RESPONSE_MAX_TOKENS,
+    MIN_IMAGE_PREFLIGHT_RESPONSE_MAX_TOKENS,
+    MAX_IMAGE_PREFLIGHT_RESPONSE_MAX_TOKENS,
+  );
+  const count = Math.max(1, Math.min(Math.trunc(Number(imageCount) || 1), MAX_IMAGE_PREFLIGHT_IMAGES));
+  return Math.min(perImage * count, MAX_IMAGE_PREFLIGHT_REQUEST_MAX_TOKENS);
+}
+
+function buildVisionRequest(images, config, event = {}, ctx = {}, collected = { images }) {
+  const outputTokens = imageVisionOutputTokens(config, images.length);
+  let requestText = redactImageDataText(event.text || '');
+  requestText = rewriteAnalyzedImageReferences(requestText, { collected });
+  requestText = redactLocalPathText(requestText);
+  requestText = redactImageDataText(requestText);
+  const prompt = [
+    'Analyze these user-supplied images so a downstream text-only model can answer the user without reading image files.',
+    'Extract enough visual, textual, and structural evidence to support careful reasoning.',
+    'Keep direct observations separate from inference, uncertainty, and scoped negative evidence.',
+    'Use the labels from the image inventory exactly.',
+    '',
+    `Original user text:\n${truncateText(requestText)}`,
+    '',
+    'Image inventory:',
+    ...images.map((image) => `- ${image.label}: ${image.displayName || image.origin}; mime=${image.mediaType}; bytes=${image.byteLength}`),
+  ].join('\n');
+  return {
+    model: config.model,
+    maxTokens: outputTokens,
+    maxOutputTokens: outputTokens,
+    maxOutputTokenCap: outputTokens,
+    streamIdleTimeoutMs: config.streamIdleTimeoutMs,
+    systemPrompt: visionSystemPrompt(),
+    messages: [
+      {
+        role: 'user',
+        content: [{ type: 'text', text: prompt }, ...images.map((image) => image.contentPart)],
+      },
+    ],
+    images: images.map(({
+      data: _data,
+      contentPart: _contentPart,
+      path: _path,
+      originalPath: _originalPath,
+      pathAliases: _pathAliases,
+      ...safe
+    }) => safe),
+    event: {
+      sessionId: firstString(event.sessionId, event.session_id, ctx.sessionId, ctx.session_id),
+      turnId: firstString(event.turnId, event.turn_id, ctx.turnId, ctx.turn_id),
+    },
+  };
+}
+
+async function runImageVisionPreflightRequest(images, config, event = {}, ctx = {}, collected = { images }, options = {}) {
+  const request = buildVisionRequest(images, config, event, ctx, collected);
+  const result = await withVisionTimeout(config.timeoutMs, ctx.signal, (signal) => {
+    request.signal = signal;
+    return invokeVisionPreflight(request, ctx, options);
+  });
+  return {
+    request,
+    summaryImages: alignSingleImageBatchSummaryLabels(
+      sanitizeVisionSummaries(normalizeVisionSummary(result), collected),
+      images,
+    ),
+  };
+}
+
+function imagePreflightTimedOut(error) {
+  return /timed?\s*out|timeout/i.test(String(error?.message ?? error ?? ''));
+}
+
+function imagePreflightTimeoutRetryBatchSize(imageCount) {
+  const count = Math.max(0, Math.trunc(Number(imageCount) || 0));
+  if (count <= 1) return count;
+  return Math.max(1, Math.min(IMAGE_PREFLIGHT_ARTIFACT_IMAGES_PER_HANDLE, Math.floor(count / 2)));
+}
+
+async function retryImageVisionPreflightAfterTimeout(error, config, event = {}, ctx = {}, collected = { images: [] }, options = {}) {
+  const images = Array.isArray(collected.images) ? collected.images : [];
+  if (!imagePreflightTimedOut(error) || images.length <= 1) throw error;
+
+  const batchSize = imagePreflightTimeoutRetryBatchSize(images.length);
+  const requests = [];
+  const summaryImages = [];
+  try {
+    for (let index = 0; index < images.length; index += batchSize) {
+      const attempt = await runImageVisionPreflightRequest(
+        images.slice(index, index + batchSize),
+        config,
+        event,
+        ctx,
+        collected,
+        options,
+      );
+      requests.push(attempt.request);
+      summaryImages.push(...attempt.summaryImages);
+    }
+  } catch {
+    throw error;
+  }
+  return { request: requests[0], requests, summaryImages, retriedAfterTimeout: true };
+}
+
+function extractVisionText(result) {
+  if (typeof result === 'string') return result;
+  if (!result || typeof result !== 'object') return '';
+  if (typeof result.text === 'string') return result.text;
+  if (typeof result.output === 'string') return result.output;
+  if (typeof result.content === 'string') return result.content;
+  if (Array.isArray(result.content)) {
+    return result.content
+      .map((item) => (typeof item === 'string' ? item : (item && typeof item.text === 'string' ? item.text : '')))
+      .filter(Boolean)
+      .join('\n');
+  }
+  if (Array.isArray(result.messages)) {
+    return result.messages.map(extractVisionText).filter(Boolean).join('\n');
+  }
+  return '';
+}
+
+function visionSummaryJsonCandidates(text) {
+  const candidates = [];
+  const trimmed = String(text || '').trim();
+  if (!trimmed) return candidates;
+  candidates.push(trimmed);
+  const fencePattern = /```(?:json)?\s*([\s\S]*?)```/gi;
+  let match;
+  while ((match = fencePattern.exec(trimmed)) !== null) {
+    const fenced = match[1]?.trim();
+    if (fenced) candidates.push(fenced);
+  }
+  return candidates;
+}
+
+function normalizeVisionSummary(result) {
+  if (result && typeof result === 'object' && Array.isArray(result.images)) return result.images;
+  const text = extractVisionText(result);
+  if (!text) return [];
+  for (const candidate of visionSummaryJsonCandidates(text)) {
+    try {
+      const parsed = JSON.parse(candidate);
+      if (parsed && typeof parsed === 'object' && Array.isArray(parsed.images)) return parsed.images;
+    } catch {
+      // Fall back to the next candidate, then heading parsing below.
+    }
+  }
+  const observed = [];
+  const uncertainties = [];
+  const inferences = [];
+  let target;
+  for (const rawLine of text.split(/\r?\n/)) {
+    const line = rawLine.trim();
+    if (!line) continue;
+    if (/^observed(?:\s+facts)?\s*:/i.test(line)) {
+      target = observed;
+      continue;
+    }
+    if (/^(uncertaint(?:y|ies)|limits?|unknowns?)\s*:/i.test(line)) {
+      target = uncertainties;
+      continue;
+    }
+    if (/^(inferences?|interpretations?)\s*:/i.test(line)) {
+      target = inferences;
+      continue;
+    }
+    const cleaned = line.replace(/^[-*]\s*/, '');
+    if (target) target.push(cleaned);
+  }
+  if (observed.length || uncertainties.length || inferences.length) return [{ label: 'image-1', observed_facts: observed, uncertainties, inferences }];
+  return [{ label: 'image-1', observed_facts: [], inferences: [`Unstructured vision output: ${truncateText(text, 2000)}`] }];
+}
+
+function sanitizeVisionSummaryText(value, collected = { images: [], skipped: [] }) {
+  let text = sanitizeExternalText(value, { maxLength: Infinity });
+  text = redactImageDataText(text);
+  text = rewriteAnalyzedImageReferences(text, { collected });
+  text = redactLocalPathText(text);
+  return redactImageDataText(text);
+}
+
+function sanitizeVisionSummaryValue(value, collected = { images: [], skipped: [] }, depth = 0) {
+  if (typeof value === 'string') return sanitizeVisionSummaryText(value, collected);
+  if (value === undefined || value === null || typeof value !== 'object') return value;
+  if (depth >= 8) return sanitizeVisionSummaryText(visionScalarText(value), collected);
+  if (Array.isArray(value)) return value.map((item) => sanitizeVisionSummaryValue(item, collected, depth + 1));
+  const sanitized = {};
+  for (const [key, item] of Object.entries(value)) {
+    const cleanKeyBase = sanitizeVisionSummaryText(key, collected) || 'field';
+    let cleanKey = cleanKeyBase;
+    let suffix = 2;
+    while (Object.hasOwn(sanitized, cleanKey)) {
+      cleanKey = `${cleanKeyBase}_${suffix}`;
+      suffix += 1;
+    }
+    sanitized[cleanKey] = sanitizeVisionSummaryValue(item, collected, depth + 1);
+  }
+  return sanitized;
+}
+
+function sanitizeVisionSummaries(summaryImages = [], collected = { images: [], skipped: [] }) {
+  if (!Array.isArray(summaryImages)) return [];
+  return summaryImages.map((summary) => sanitizeVisionSummaryValue(summary, collected));
+}
+
+function alignSingleImageBatchSummaryLabels(summaryImages = [], images = []) {
+  if (!Array.isArray(summaryImages) || images.length !== 1) return summaryImages;
+  const label = firstString(images[0]?.label);
+  if (!label) return summaryImages;
+  const first = summaryImages[0];
+  if (!first || typeof first !== 'object' || Array.isArray(first)) return summaryImages;
+  return [{ ...first, label }];
+}
+
+function apiKeyEnvName(reference) {
+  const raw = String(reference || '').trim();
+  if (!raw) return undefined;
+  const braced = raw.match(/^\$\{([A-Za-z_][A-Za-z0-9_]*)}$/);
+  if (braced) return braced[1];
+  if (raw.startsWith('$')) {
+    const name = raw.slice(1);
+    return /^[A-Za-z_][A-Za-z0-9_]*$/.test(name) ? name : undefined;
+  }
+  return /^[A-Z_][A-Z0-9_]*$/.test(raw) ? raw : undefined;
+}
+
+function providerApiKeyReferences(providerName, providerConfig = {}) {
+  const refs = [
+    providerConfig.apiKey,
+    providerConfig.api_key,
+    providerConfig.apiKeyEnv,
+    providerConfig.api_key_env,
+  ];
+  if (providerName === 'kimi-coding') refs.push('KIMI_API_KEY', 'KIMI_CODE_API_KEY');
+  return [...new Set(refs
+    .filter((ref) => typeof ref === 'string')
+    .map((ref) => ref.trim())
+    .filter(Boolean))];
+}
+
+function resolveProviderApiKey(providerName, providerConfig = {}, env = process.env) {
+  const missing = [];
+  for (const ref of providerApiKeyReferences(providerName, providerConfig)) {
+    const envName = apiKeyEnvName(ref);
+    if (envName) {
+      const value = firstString(env[envName]);
+      if (value) return { value, envName };
+      missing.push(envName);
+      continue;
+    }
+    return { value: ref, literal: true };
+  }
+  return { missing: [...new Set(missing)] };
+}
+
+function providerBaseUrl(providerConfig = {}) {
+  const baseUrl = firstString(providerConfig.baseUrl, providerConfig.base_url, providerConfig.url, providerConfig.endpoint);
+  if (!baseUrl) return undefined;
+  return String(baseUrl).replace(/\/+$/g, '');
+}
+
+function providerUsesOpenAICompatibleChat(providerConfig = {}) {
+  const api = firstString(providerConfig.api, providerConfig.kind, providerConfig.protocol);
+  return !api || OPENAI_COMPATIBLE_APIS.has(String(api).trim().toLowerCase());
+}
+
+function providerUsesAnthropicMessages(providerConfig = {}) {
+  const api = firstString(providerConfig.api, providerConfig.kind, providerConfig.protocol);
+  return ANTHROPIC_MESSAGES_APIS.has(String(api || '').trim().toLowerCase());
+}
+
+function openAIChatCompletionsUrl(baseUrl) {
+  const trimmed = String(baseUrl || '').replace(/\/+$/g, '');
+  if (trimmed.endsWith('/chat/completions')) return trimmed;
+  return `${trimmed}/chat/completions`;
+}
+
+function anthropicMessagesUrl(baseUrl) {
+  const trimmed = String(baseUrl || '').replace(/\/+$/g, '');
+  if (trimmed.endsWith('/messages')) return trimmed;
+  if (trimmed.endsWith('/v1')) return `${trimmed}/messages`;
+  return `${trimmed}/v1/messages`;
+}
+
+function openAICompatibleContentPart(part) {
+  if (typeof part === 'string') return { type: 'text', text: part };
+  if (!part || typeof part !== 'object') return undefined;
+  if (part.type === 'text') return { type: 'text', text: String(part.text || '') };
+  if (part.type === 'image_url' && part.image_url) return part;
+  if (part.type !== 'image') return undefined;
+  const source = part.source && typeof part.source === 'object' ? part.source : {};
+  const mediaType = normalizeImageMime(source.mediaType || source.mimeType || part.mediaType || part.mimeType);
+  const data = firstString(source.data, source.base64, part.data, part.base64);
+  if (!mediaType || !data) return undefined;
+  return {
+    type: 'image_url',
+    image_url: { url: `data:${mediaType};base64,${data}` },
+  };
+}
+
+function openAICompatibleMessage(message = {}) {
+  const role = firstString(message.role) || 'user';
+  const content = Array.isArray(message.content)
+    ? message.content.map(openAICompatibleContentPart).filter(Boolean)
+    : String(message.content || '');
+  return { role, content };
+}
+
+function imageVisionOutputTokenCap(request = {}, options = {}) {
+  return clampedInteger(
+    firstPresent(options.maxVisionTokenCap, request.maxOutputTokenCap),
+    MAX_IMAGE_PREFLIGHT_RESPONSE_MAX_TOKENS,
+    MIN_IMAGE_PREFLIGHT_RESPONSE_MAX_TOKENS,
+    MAX_IMAGE_PREFLIGHT_REQUEST_MAX_TOKENS,
+  );
+}
+
+function buildOpenAIVisionPayload(request, resolvedProvider, options = {}) {
+  const providerConfig = resolvedProvider.providerConfig || {};
+  const compat = providerConfig.compat && typeof providerConfig.compat === 'object' ? providerConfig.compat : {};
+  const messages = (Array.isArray(request.messages) ? request.messages : []).map(openAICompatibleMessage);
+  if (request.systemPrompt) {
+    if (compat.supportsSystemRole === false && messages.length > 0) {
+      const first = messages[0];
+      first.content = Array.isArray(first.content)
+        ? [{ type: 'text', text: request.systemPrompt }, ...first.content]
+        : `${request.systemPrompt}\n\n${first.content || ''}`;
+    } else {
+      messages.unshift({ role: 'system', content: request.systemPrompt });
+    }
+  }
+  const maxTokensField = firstString(compat.maxTokensField, compat.max_tokens_field) || 'max_tokens';
+  const maxTokens = clampedInteger(
+    firstPresent(
+      options.maxVisionTokens,
+      request.maxOutputTokens,
+      request.maxTokens,
+      providerConfig.visionMaxTokens,
+      resolvedProvider.modelConfig?.visionMaxTokens,
+    ),
+    DEFAULT_IMAGE_PREFLIGHT_RESPONSE_MAX_TOKENS,
+    MIN_IMAGE_PREFLIGHT_RESPONSE_MAX_TOKENS,
+    imageVisionOutputTokenCap(request, options),
+  );
+  return {
+    model: resolvedProvider.modelId,
+    messages,
+    [maxTokensField]: maxTokens,
+  };
+}
+
+function extractOpenAICompletionText(payload) {
+  if (!payload || typeof payload !== 'object') return '';
+  if (typeof payload.output_text === 'string') return payload.output_text;
+  if (typeof payload.text === 'string') return payload.text;
+  if (Array.isArray(payload.choices)) {
+    return payload.choices
+      .map((choice) => extractVisionText(choice?.message ?? choice?.delta ?? choice))
+      .filter(Boolean)
+      .join('\n');
+  }
+  return extractVisionText(payload);
+}
+
+function anthropicContentPart(part) {
+  if (typeof part === 'string') return { type: 'text', text: part };
+  if (!part || typeof part !== 'object') return undefined;
+  if (part.type === 'text') return { type: 'text', text: String(part.text || '') };
+  if (part.type !== 'image') return undefined;
+  const source = part.source && typeof part.source === 'object' ? part.source : {};
+  const mediaType = normalizeImageMime(source.mediaType || source.mimeType || part.mediaType || part.mimeType);
+  const data = firstString(source.data, source.base64, part.data, part.base64);
+  if (!mediaType || !data) return undefined;
+  return {
+    type: 'image',
+    source: {
+      type: 'base64',
+      media_type: mediaType,
+      data,
+    },
+  };
+}
+
+function anthropicMessage(message = {}) {
+  const role = firstString(message.role) === 'assistant' ? 'assistant' : 'user';
+  const content = Array.isArray(message.content)
+    ? message.content.map(anthropicContentPart).filter(Boolean)
+    : String(message.content || '');
+  return { role, content };
+}
+
+function providerStaticHeaders(providerConfig = {}, modelConfig = {}) {
+  return {
+    ...(providerConfig.headers && typeof providerConfig.headers === 'object' ? providerConfig.headers : {}),
+    ...(modelConfig.headers && typeof modelConfig.headers === 'object' ? modelConfig.headers : {}),
+  };
+}
+
+function responseHeader(response, name) {
+  const headers = response?.headers;
+  if (!headers || typeof headers.get !== 'function') return '';
+  return String(headers.get(name) || '');
+}
+
+function responseIsEventStream(response) {
+  return /\btext\/event-stream\b/i.test(responseHeader(response, 'content-type'));
+}
+
+function shouldStreamAnthropicVisionPreflight(resolvedProvider = {}, options = {}) {
+  if (options.streamVisionPreflight === false) return false;
+  if (options.streamVisionPreflight === true) return true;
+  const providerConfig = resolvedProvider.providerConfig || {};
+  if (parseBoolean(firstPresent(providerConfig.visionStream, providerConfig.vision_stream, providerConfig.stream), false)) {
+    return true;
+  }
+  return firstString(resolvedProvider.providerName) === 'kimi-coding';
+}
+
+function buildAnthropicVisionPayload(request, resolvedProvider, options = {}) {
+  const providerConfig = resolvedProvider.providerConfig || {};
+  const messages = (Array.isArray(request.messages) ? request.messages : []).map(anthropicMessage);
+  const maxTokens = clampedInteger(
+    firstPresent(
+      options.maxVisionTokens,
+      request.maxOutputTokens,
+      request.maxTokens,
+      providerConfig.visionMaxTokens,
+      resolvedProvider.modelConfig?.visionMaxTokens,
+    ),
+    DEFAULT_IMAGE_PREFLIGHT_RESPONSE_MAX_TOKENS,
+    MIN_IMAGE_PREFLIGHT_RESPONSE_MAX_TOKENS,
+    imageVisionOutputTokenCap(request, options),
+  );
+  const payload = {
+    model: resolvedProvider.modelId,
+    messages,
+    max_tokens: maxTokens,
+    stream: options.stream === true,
+  };
+  if (request.systemPrompt) {
+    payload.system = [{ type: 'text', text: request.systemPrompt }];
+  }
+  return payload;
+}
+
+function parseServerSentEventBlock(block) {
+  let event = 'message';
+  const data = [];
+  for (const line of String(block || '').split(/\r?\n/)) {
+    if (!line || line.startsWith(':')) continue;
+    if (line.startsWith('event:')) {
+      event = line.slice(6).trim() || event;
+    } else if (line.startsWith('data:')) {
+      data.push(line.slice(5).trimStart());
+    }
+  }
+  return { event, data: data.join('\n') };
+}
+
+function nextServerSentEventSeparator(buffer) {
+  const match = String(buffer || '').match(/\r?\n\r?\n/);
+  return match && match.index !== undefined
+    ? { index: match.index, length: match[0].length }
+    : undefined;
+}
+
+function anthropicStreamTextDelta(payload) {
+  const delta = payload?.delta;
+  if (delta?.type === 'text_delta' && typeof delta.text === 'string') return delta.text;
+  if (typeof delta?.text === 'string') return delta.text;
+  if (payload?.type === 'content_block_start' && payload.content_block?.type === 'text') {
+    return typeof payload.content_block.text === 'string' ? payload.content_block.text : '';
+  }
+  return '';
+}
+
+function anthropicStreamSemanticProgress(payload) {
+  const delta = payload?.delta;
+  return Boolean(firstString(
+    anthropicStreamTextDelta(payload),
+    delta?.thinking,
+    delta?.partial_json,
+  ));
+}
+
+async function readWithAbort(reader, signal) {
+  if (signal?.aborted) throw (signal.reason instanceof Error ? signal.reason : new Error('vision preflight stream aborted'));
+  let onAbort;
+  const aborted = new Promise((_resolve, reject) => {
+    onAbort = () => reject(signal?.reason instanceof Error ? signal.reason : new Error('vision preflight stream aborted'));
+    signal?.addEventListener?.('abort', onAbort, { once: true });
+  });
+  try {
+    return await Promise.race([reader.read(), aborted]);
+  } finally {
+    signal?.removeEventListener?.('abort', onAbort);
+  }
+}
+
+async function withVisionStreamIdleTimeout(timeoutMs, parentSignal, action) {
+  const controller = new AbortController();
+  const onAbort = () => controller.abort(parentSignal?.reason instanceof Error ? parentSignal.reason : new Error('vision preflight aborted'));
+  parentSignal?.addEventListener?.('abort', onAbort, { once: true });
+  const idleMs = clampedInteger(
+    timeoutMs,
+    DEFAULT_IMAGE_PREFLIGHT_STREAM_IDLE_TIMEOUT_MS,
+    MIN_IMAGE_PREFLIGHT_STREAM_IDLE_TIMEOUT_MS,
+    MAX_IMAGE_PREFLIGHT_STREAM_IDLE_TIMEOUT_MS,
+  );
+  let timer;
+  const resetIdle = (label = 'stream token') => {
+    clearTimeout(timer);
+    timer = setTimeout(() => {
+      controller.abort(new Error(`vision preflight stream idle timed out waiting for ${label}`));
+    }, idleMs);
+  };
+  resetIdle('first stream token');
+  try {
+    return await action(controller.signal, resetIdle);
+  } finally {
+    clearTimeout(timer);
+    parentSignal?.removeEventListener?.('abort', onAbort);
+  }
+}
+
+async function readAnthropicEventStreamResponse(response, providerName, secretValues = [], options = {}) {
+  if (!response?.ok) {
+    return { text: extractAnthropicMessageText(await readProviderJsonResponse(response, providerName, secretValues)) };
+  }
+  const reader = response.body && typeof response.body.getReader === 'function' ? response.body.getReader() : undefined;
+  if (!reader) {
+    return { text: extractAnthropicMessageText(await readProviderJsonResponse(response, providerName, secretValues)) };
+  }
+  const decoder = new TextDecoder();
+  const output = [];
+  const eventTypes = {};
+  let buffer = '';
+  try {
+    for (;;) {
+      const { value, done } = await readWithAbort(reader, options.signal);
+      if (done) break;
+      buffer += decoder.decode(value, { stream: true });
+      let separator;
+      while ((separator = nextServerSentEventSeparator(buffer))) {
+        const block = buffer.slice(0, separator.index);
+        buffer = buffer.slice(separator.index + separator.length);
+        const event = parseServerSentEventBlock(block);
+        if (!event.data) continue;
+        if (event.data === '[DONE]') {
+          eventTypes['[DONE]'] = (eventTypes['[DONE]'] || 0) + 1;
+          continue;
+        }
+        let parsed;
+        try {
+          parsed = JSON.parse(event.data);
+        } catch (error) {
+          throw new Error(`vision provider ${providerName} returned invalid event stream JSON: ${redactProviderText(error?.message || event.data, 240)}`);
+        }
+        const type = firstString(parsed?.type, event.event) || 'message';
+        eventTypes[type] = (eventTypes[type] || 0) + 1;
+        const text = anthropicStreamTextDelta(parsed);
+        if (text) output.push(text);
+        if (anthropicStreamSemanticProgress(parsed)) options.resetIdle?.('next stream token');
+      }
+    }
+    const trailing = buffer + decoder.decode();
+    if (trailing.trim()) {
+      throw new Error(`vision provider ${providerName} returned incomplete event stream data`);
+    }
+  } catch (error) {
+    try {
+      await reader.cancel(error);
+    } catch {
+      // The stream may already be closed or aborted by the provider.
+    }
+    throw error;
+  }
+  return { text: output.join(''), response: { stream: true, eventTypes } };
+}
+
+function extractAnthropicMessageText(payload) {
+  if (!payload || typeof payload !== 'object') return '';
+  if (typeof payload.text === 'string') return payload.text;
+  if (Array.isArray(payload.content)) {
+    return payload.content
+      .map((item) => {
+        if (typeof item === 'string') return item;
+        if (item && typeof item.text === 'string') return item.text;
+        return '';
+      })
+      .filter(Boolean)
+      .join('\n');
+  }
+  return extractVisionText(payload);
+}
+
+async function readProviderJsonResponse(response, providerName, secretValues = []) {
+  const text = typeof response?.text === 'function' ? await response.text() : '';
+  if (!response?.ok) {
+    const status = Number.isFinite(response?.status) ? response.status : 'unknown';
+    const detail = redactSearchError(text, secretValues);
+    throw new Error(`vision provider ${providerName} returned HTTP ${status}${detail ? `: ${detail}` : ''}`);
+  }
+  try {
+    return text ? JSON.parse(text) : {};
+  } catch (error) {
+    throw new Error(`vision provider ${providerName} returned invalid JSON: ${redactProviderText(error?.message || text, 240)}`);
+  }
+}
+
+async function invokeOpenAICompatibleVisionPreflight(request, ctx = {}, options = {}) {
+  const env = options.env ?? process.env;
+  const resolvedProvider = resolveVisionProviderConfig(request.model, options);
+  if (!resolvedProvider) throw new Error(`vision model not found in models.json: ${request.model}`);
+  const { providerName, providerConfig, modelConfig } = resolvedProvider;
+  if (!providerUsesOpenAICompatibleChat(providerConfig)) {
+    throw new Error(`vision provider ${providerName} is not OpenAI-compatible`);
+  }
+  const baseUrl = providerBaseUrl(providerConfig);
+  if (!baseUrl) throw new Error(`vision provider ${providerName} is missing baseUrl`);
+  const apiKey = resolveProviderApiKey(providerName, providerConfig, env);
+  if (!apiKey.value) {
+    const missing = apiKey.missing?.length ? apiKey.missing.join(' or ') : 'provider API key';
+    throw new Error(`missing ${missing} for vision model ${request.model}`);
+  }
+  const fetchFn = options.fetch ?? ctx.fetch ?? globalThis.fetch;
+  if (typeof fetchFn !== 'function') throw new Error('vision preflight requires fetch for configured provider fallback');
+  const payload = buildOpenAIVisionPayload(request, resolvedProvider, options);
+  const response = await fetchFn(openAIChatCompletionsUrl(baseUrl), {
+    method: 'POST',
+    headers: {
+      ...providerStaticHeaders(providerConfig, modelConfig),
+      authorization: `Bearer ${apiKey.value}`,
+      'content-type': 'application/json',
+    },
+    body: JSON.stringify(payload),
+    signal: request.signal,
+  });
+  const json = await readProviderJsonResponse(response, providerName, [apiKey.value]);
+  return { text: extractOpenAICompletionText(json), response: json };
+}
+
+async function invokeAnthropicMessagesVisionPreflight(request, ctx = {}, options = {}) {
+  const env = options.env ?? process.env;
+  const resolvedProvider = resolveVisionProviderConfig(request.model, options);
+  if (!resolvedProvider) throw new Error(`vision model not found in models.json: ${request.model}`);
+  const { providerName, providerConfig, modelConfig } = resolvedProvider;
+  if (!providerUsesAnthropicMessages(providerConfig)) {
+    throw new Error(`vision provider ${providerName} is not Anthropic Messages-compatible`);
+  }
+  const baseUrl = providerBaseUrl(providerConfig);
+  if (!baseUrl) throw new Error(`vision provider ${providerName} is missing baseUrl`);
+  const apiKey = resolveProviderApiKey(providerName, providerConfig, env);
+  if (!apiKey.value) {
+    const missing = apiKey.missing?.length ? apiKey.missing.join(' or ') : 'provider API key';
+    throw new Error(`missing ${missing} for vision model ${request.model}`);
+  }
+  const fetchFn = options.fetch ?? ctx.fetch ?? globalThis.fetch;
+  if (typeof fetchFn !== 'function') throw new Error('vision preflight requires fetch for configured provider fallback');
+  const stream = shouldStreamAnthropicVisionPreflight(resolvedProvider, options);
+  const invoke = async (signal = request.signal, resetIdle) => {
+    const payload = buildAnthropicVisionPayload(request, resolvedProvider, { ...options, stream });
+    const response = await fetchFn(anthropicMessagesUrl(baseUrl), {
+      method: 'POST',
+      headers: {
+        ...providerStaticHeaders(providerConfig, modelConfig),
+        'x-api-key': apiKey.value,
+        accept: stream ? 'text/event-stream, application/json' : 'application/json',
+        'content-type': 'application/json',
+        'anthropic-dangerous-direct-browser-access': 'true',
+      },
+      body: JSON.stringify(payload),
+      signal,
+    });
+    if (stream && responseIsEventStream(response)) {
+      return readAnthropicEventStreamResponse(response, providerName, [apiKey.value], {
+        signal,
+        resetIdle,
+      });
+    }
+    const json = await readProviderJsonResponse(response, providerName, [apiKey.value]);
+    return { text: extractAnthropicMessageText(json), response: json };
+  };
+  if (stream) {
+    return withVisionStreamIdleTimeout(request.streamIdleTimeoutMs, request.signal, invoke);
+  }
+  return invoke();
+}
+
+async function invokeConfiguredProviderVisionPreflight(request, ctx = {}, options = {}) {
+  const resolvedProvider = resolveVisionProviderConfig(request.model, options);
+  if (!resolvedProvider) throw new Error(`vision model not found in models.json: ${request.model}`);
+  if (providerUsesAnthropicMessages(resolvedProvider.providerConfig)) {
+    return invokeAnthropicMessagesVisionPreflight(request, ctx, options);
+  }
+  return invokeOpenAICompatibleVisionPreflight(request, ctx, options);
+}
+
+async function invokeVisionPreflight(request, ctx = {}, options = {}) {
+  const direct = options.visionPreflight || ctx.visionPreflight || ctx.runVisionPreflight || ctx.imageVisionPreflight;
+  if (typeof direct === 'function') return direct(request);
+
+  const complete = options.complete || ctx.complete;
+  const registry = options.modelRegistry || ctx.modelRegistry;
+  if (typeof complete !== 'function') {
+    return invokeConfiguredProviderVisionPreflight(request, ctx, options);
+  }
+  if (!registry) {
+    return complete(request);
+  }
+  const parts = modelRefParts(request.model);
+  const model = registry.find?.(parts.provider, parts.modelId) || registry.find?.(parts.full || request.model) || registry.get?.(parts.full || request.model);
+  if (!model) throw new Error(`vision model not found: ${request.model}`);
+  const auth = await registry.getApiKeyAndHeaders?.(model);
+  return complete(
+    model,
+    {
+      systemPrompt: request.systemPrompt,
+      messages: request.messages,
+    },
+    {
+      ...(auth || {}),
+      signal: request.signal,
+    },
+  );
+}
+
+async function withVisionTimeout(timeoutMs, parentSignal, action) {
+  const controller = new AbortController();
+  const onAbort = () => controller.abort(parentSignal?.reason instanceof Error ? parentSignal.reason : new Error('vision preflight aborted'));
+  parentSignal?.addEventListener?.('abort', onAbort, { once: true });
+  let timer;
+  try {
+    return await Promise.race([
+      Promise.resolve().then(() => action(controller.signal)),
+      new Promise((_resolve, reject) => {
+        timer = setTimeout(() => {
+          const error = new Error('vision preflight timed out');
+          controller.abort(error);
+          reject(error);
+        }, timeoutMs);
+      }),
+    ]);
+  } finally {
+    clearTimeout(timer);
+    parentSignal?.removeEventListener?.('abort', onAbort);
+  }
+}
+
+function visionScalarText(value) {
+  if (value === undefined || value === null) return '';
+  if (typeof value === 'string') return value.trim();
+  if (typeof value === 'number' || typeof value === 'boolean') return String(value);
+  if (Array.isArray(value)) return value.map(visionScalarText).filter(Boolean).join(', ');
+  if (typeof value === 'object') {
+    return Object.entries(value)
+      .map(([key, item]) => {
+        const text = visionScalarText(item);
+        return text ? `${key}=${text}` : '';
+      })
+      .filter(Boolean)
+      .join(', ');
+  }
+  return String(value).trim();
+}
+
+function firstVisionText(item, keys) {
+  if (!item || typeof item !== 'object') return '';
+  for (const key of keys) {
+    const text = visionScalarText(item[key]);
+    if (text) return text;
+  }
+  return '';
+}
+
+function formatVisionItem(item) {
+  if (item === undefined || item === null) return '';
+  if (typeof item !== 'object' || Array.isArray(item)) return visionScalarText(item);
+
+  const id = firstVisionText(item, ['id', 'evidence_id', 'evidenceId']);
+  const primary = firstVisionText(item, [
+    'observation',
+    'text',
+    'raw_text',
+    'normalized_text',
+    'claim',
+    'description',
+    'summary',
+    'label',
+    'value',
+    'status',
+    'result',
+    'note',
+  ]);
+  const prefix = id ? `${id}: ` : '';
+  const main = primary ? `${prefix}${primary}` : `${prefix}${visionScalarText(item)}`.trim();
+  const details = [];
+  const detailKeys = [
+    ['type', 'type'],
+    ['role', 'role'],
+    ['location', 'location'],
+    ['scope', 'scope'],
+    ['state', 'state'],
+    ['status', 'status'],
+    ['result', 'result'],
+    ['value', 'value'],
+    ['translation', 'translation'],
+    ['evidence', 'evidence'],
+    ['evidence', 'evidence_ids'],
+    ['confidence', 'confidence'],
+    ['note', 'note'],
+  ];
+  for (const [label, key] of detailKeys) {
+    const text = visionScalarText(item[key]);
+    if (!text || text === primary || text === id) continue;
+    details.push(`${label}=${text}`);
+  }
+  return details.length > 0 ? `${main} (${details.join('; ')})` : main;
+}
+
+function visionItems(value) {
+  const raw = Array.isArray(value) ? value : (value === undefined || value === null || value === '' ? [] : [value]);
+  return raw.map(formatVisionItem).map((item) => item.trim()).filter(Boolean);
+}
+
+function collectVisionFields(summary = {}, keys = []) {
+  const values = [];
+  if (!summary || typeof summary !== 'object') return values;
+  for (const key of keys) values.push(...visionItems(summary[key]));
+  return [...new Set(values)];
+}
+
+function summaryForImage(image, images, summaryImages) {
+  const exact = summaryImages.find((item) => item?.label === image.label);
+  if (exact) return exact;
+  const indexed = summaryImages[images.indexOf(image)];
+  if (indexed?.label && indexed.label !== image.label) return {};
+  return indexed || {};
+}
+
+function bulletLines(items, fallback, options = {}) {
+  const values = visionItems(items);
+  if (values.length === 0) return [`- ${fallback}`];
+  const limit = Number.isFinite(options.limit) ? Math.max(1, Math.trunc(options.limit)) : values.length;
+  const scopedValues = options.evidenceScope
+    ? values.map((item) => scopeEvidenceReferences(item, options.evidenceScope, {
+      scopeCitationReferences: options.scopeCitationReferences === true,
+    }))
+    : values;
+  const shown = scopedValues.slice(0, limit);
+  const itemMaxChars = options.itemMaxChars === null
+    ? undefined
+    : Number.isFinite(options.itemMaxChars)
+      ? Math.max(200, Math.trunc(options.itemMaxChars))
+      : 1200;
+  const lines = shown.map((item) => `- ${itemMaxChars === undefined ? item : truncateText(item, itemMaxChars)}`);
+  const omitted = scopedValues.length - shown.length;
+  if (omitted > 0) lines.push(`- +${omitted} additional items omitted by Stronk Pi.`);
+  return lines;
+}
+
+function scopeEvidenceReferences(text, imageLabel, options = {}) {
+  const label = String(imageLabel || '').trim();
+  let scoped = String(text || '');
+  if (!label) return scoped;
+  const leadingScoped = scoped.match(/^(image-\d+)\.([EUNI]\d+)(?=[:\s-])/);
+  if (leadingScoped && leadingScoped[1] !== label) {
+    const previousLabel = leadingScoped[1];
+    scoped = `${label}.${leadingScoped[2]}${scoped.slice(leadingScoped[0].length)}`;
+    scoped = retargetScopedEvidenceReferences(scoped, previousLabel, label);
+  }
+  scoped = scoped.replace(/^([EUNI]\d+)(?=[:\s-])/, `${label}.$1`);
+  scoped = scoped.replace(/\b(evidence(?:_ids)?=)([^);]+)/gi, (_match, prefix, value) => (
+    `${prefix}${scopeBareEvidenceReferences(value, label)}`
+  ));
+  if (options.scopeCitationReferences) scoped = scopeBareEvidenceReferences(scoped, label);
+  return scoped;
+}
+
+function retargetScopedEvidenceReferences(text, fromLabel, toLabel) {
+  const source = String(fromLabel || '').replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+  const target = String(toLabel || '').trim();
+  if (!source || !target) return String(text || '');
+  const pattern = new RegExp(`(^|[^A-Za-z0-9_.-])${source}\\.([EUNI]\\d+)\\b`, 'g');
+  return String(text || '').replace(pattern, (_match, prefix, evidenceId) => `${prefix}${target}.${evidenceId}`);
+}
+
+function scopeBareEvidenceReferences(text, imageLabel) {
+  const label = String(imageLabel || '').trim();
+  if (!label) return String(text || '');
+  return String(text || '').replace(/(^|[^A-Za-z0-9_.-])([EUNI]\d+)\b/g, (_match, prefix, evidenceId) => (
+    `${prefix}${label}.${evidenceId}`
+  ));
+}
+
+function renderImageEvidenceIndex(lines, images = []) {
+  lines.push('', 'Image Evidence Index:');
+  if (images.length === 0) {
+    lines.push('- No supported images were analyzed.');
+    return;
+  }
+  for (const image of images) {
+    const label = firstString(image.label) || 'image';
+    const displayName = truncateText(firstString(image.displayName, image.origin, label) || label, 160);
+    const origin = truncateText(firstString(image.origin) || 'unknown', 120);
+    const mediaType = firstString(image.mediaType) || 'unknown';
+    const byteLength = Number.isFinite(image.byteLength) ? Math.max(0, Math.trunc(image.byteLength)) : 'unknown';
+    lines.push(`- ${label}: ${displayName}; source=${origin}; mime=${mediaType}; bytes=${byteLength}; citation_prefix=${label}.`);
+  }
+}
+
+function compactMediaType(mediaType) {
+  const text = String(mediaType || '').trim().toLowerCase();
+  if (!text) return 'unknown';
+  if (text.startsWith('image/')) return text.slice(6).replace('jpeg', 'jpg');
+  return text;
+}
+
+function compactByteLength(byteLength) {
+  if (!Number.isFinite(byteLength)) return '?B';
+  const bytes = Math.max(0, Math.trunc(byteLength));
+  if (bytes >= 1024 * 1024) {
+    const mib = bytes / (1024 * 1024);
+    return `${(mib >= 10 ? Math.round(mib) : Number(mib.toFixed(1))).toString()}MiB`;
+  }
+  if (bytes >= 1024) return `${Math.round(bytes / 1024)}KiB`;
+  return `${bytes}B`;
+}
+
+function imagePreflightImageRange(images = []) {
+  const labels = images.map((image) => firstString(image?.label)).filter(Boolean);
+  if (labels.length === 0) return 'none';
+  if (labels.length === 1) return labels[0];
+  return `${labels[0]}..${labels[labels.length - 1]}`;
+}
+
+function imagePreflightArtifactGroupsForCompact(artifact) {
+  if (Array.isArray(artifact?.groups) && artifact.groups.length > 0) return artifact.groups;
+  if (artifact?.handle) return [{
+    handle: artifact.handle,
+    imageRange: artifact.imageRange || 'all images',
+    imageLabels: artifact.imageLabels || [],
+    charLength: artifact.charLength,
+    truncated: artifact.truncated,
+  }];
+  return [];
+}
+
+function imagePreflightArtifactGroupForImage(artifact, label) {
+  if (!label) return undefined;
+  return imagePreflightArtifactGroupsForCompact(artifact).find((group) => (
+    Array.isArray(group.imageLabels) && group.imageLabels.includes(label)
+  ));
+}
+
+function imagePreflightArtifactGroupLine(group = {}) {
+  const range = firstString(group.imageRange) || 'images';
+  const handle = firstString(group.handle) || 'missing-handle';
+  const charCount = Number.isFinite(group.charLength) ? ` chars=${group.charLength}` : '';
+  const capped = group.truncated ? ' capped=true' : ' capped=false';
+  return `${range}: handle=${handle}${charCount}${capped}`;
+}
+
+function compactImageIndexEntry(image = {}, artifact) {
+  const label = firstString(image.label) || 'image';
+  const displayName = truncateText(firstString(image.displayName, image.origin, label) || label, 72);
+  const group = imagePreflightArtifactGroupForImage(artifact, label);
+  const groupSuffix = group?.imageRange ? `@${group.imageRange}` : '';
+  return `${label}=${displayName}/${compactMediaType(image.mediaType)}/${compactByteLength(image.byteLength)}${groupSuffix}`;
+}
+
+function renderCompactVisionContext({ config, images, summaryImages, skipped = [], failure, artifact, maxChars = MAX_IMAGE_PREFLIGHT_CONTEXT_TEXT_CHARS }) {
+  const analyzedCount = failure ? summaryImages.length : images.length;
+  const artifactGroups = imagePreflightArtifactGroupsForCompact(artifact);
+  const index = images.length > 0
+    ? images.map((image) => compactImageIndexEntry(image, artifact)).join('; ')
+    : 'none supported';
+  const lines = [
+    `<${IMAGE_PREFLIGHT_CONTEXT_TAG}>`,
+    `${IMAGE_PREFLIGHT_MARKER} | model=${config.model} | analyzed=${analyzedCount}`,
+    '',
+    `Artifact index only. Do not make visual claims from this block alone; call ${IMAGE_PREFLIGHT_READ_TOOL} with the handle for the relevant image group before citing evidence. For cross-image claims, read every relevant group. Unshown details are unavailable, not absent.`,
+    `Artifact Groups: ${artifactGroups.map(imagePreflightArtifactGroupLine).join('; ')}`,
+    `Image Evidence Index: ${index}`,
+  ];
+  if (failure) lines.push(`Preflight status: failed (${failure})`);
+  if (skipped.length > 0) {
+    const shown = skipped.slice(0, MAX_IMAGE_PREFLIGHT_IMAGES).map((item) => {
+      const name = safeImageDisplayName(item, item.label || item.origin || 'image');
+      return `${name}=${item.reason}`;
+    });
+    const omitted = skipped.length - shown.length;
+    lines.push(`Skipped Images: ${shown.join('; ')}${omitted > 0 ? `; omitted=${omitted}` : ''}`);
+  }
+  lines.push(`</${IMAGE_PREFLIGHT_CONTEXT_TAG}>`);
+  const rendered = lines.join('\n');
+  return Number.isFinite(maxChars) ? truncateText(rendered, maxChars) : rendered;
+}
+
+function renderVisionImageSection(lines, title, images, summaryImages, fieldKeys, fallback, options = {}) {
+  const sectionItems = images.map((image) => ({
+    image,
+    items: collectVisionFields(summaryForImage(image, images, summaryImages), fieldKeys),
+  }));
+  const hasItems = sectionItems.some((entry) => entry.items.length > 0);
+  if (!options.required && !hasItems) return;
+
+  lines.push('', `${title}:`);
+  for (const { image, items } of sectionItems) {
+    const heading = options.includeImageMeta
+      ? `${image.label} (${image.displayName || image.origin}; ${image.mediaType}; ${image.byteLength} bytes)`
+      : image.label;
+    lines.push(heading);
+    lines.push(...bulletLines(items, fallback, {
+      limit: options.limit,
+      evidenceScope: image.label,
+      scopeCitationReferences: options.scopeCitationReferences,
+      itemMaxChars: options.itemMaxChars,
+    }));
+  }
+  if (images.length === 0) lines.push(`- ${options.emptyFallback || fallback}`);
+}
+
+function countLabel(count, singular, plural = `${singular}s`) {
+  const value = Number.isFinite(count) ? Math.max(0, Math.trunc(count)) : 0;
+  return `${value} ${value === 1 ? singular : plural}`;
+}
+
+function safeImagePreflightFailureReason(reason) {
+  const text = String(reason || '').toLowerCase();
+  if (/timed?\s*out|timeout/.test(text)) return 'timed out';
+  if (/missing .*key|api key|credential|authentication|unauthori[sz]ed|http\s*401|http\s*403/.test(text)) return 'missing vision model credentials';
+  if (/invalid json|invalid response|malformed/.test(text)) return 'vision provider returned invalid response';
+  if (/unsupported mime|unsupported image|invalid image|image exceeds|max_bytes|max_images/.test(text)) return 'unsupported or oversized image';
+  if (/ctx\.complete|ctx\.visionpreflight|unavailable|missing.*fetch|model not found/.test(text)) return 'vision preflight unavailable';
+  if (text) return 'vision provider request failed';
+  return 'unexpected vision preflight error';
+}
+
+function formatImagePreflightStatus(status = {}) {
+  const imageCount = Number(status.imageCount ?? status.analyzedCount ?? 0);
+  const skippedCount = Number(status.skippedCount ?? 0);
+  const skipped = skippedCount > 0 ? `; skipped ${countLabel(skippedCount, 'image')}` : '';
+  if (status.phase === 'analyzing') {
+    return `Stronk Pi detected ${countLabel(imageCount, 'image')} for a text-only model; analyzing with vision preflight.`;
+  }
+  if (status.phase === 'complete') {
+    return `Image vision preflight complete: analyzed ${countLabel(imageCount, 'image')}${skipped}.`;
+  }
+  if (status.phase === 'skipped') {
+    return `Image vision preflight skipped: no supported images found${skipped}.`;
+  }
+  if (status.phase === 'failed') {
+    const reason = safeImagePreflightFailureReason(status.reason);
+    const mode = status.failureMode === 'block' ? '' : '; using a failure note instead of raw images';
+    return `Image vision preflight failed: ${reason}${mode}.`;
+  }
+  return undefined;
+}
+
+function emitImagePreflightStatus(options = {}, status = {}) {
+  if (typeof options.onStatus !== 'function') return false;
+  try {
+    options.onStatus(status);
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+function visionContextIdentity(source) {
+  if (source === IMAGE_READ_TOOL) {
+    return {
+      tag: IMAGE_READ_CONTEXT_TAG,
+      marker: IMAGE_READ_MARKER,
+      guidance: 'Use this block as the image_read result for this turn. Do not re-read this same image unless the user asks for a fresh analysis or file metadata.',
+      failureLabel: 'Image read status',
+    };
+  }
+  return {
+    tag: IMAGE_PREFLIGHT_CONTEXT_TAG,
+    marker: IMAGE_PREFLIGHT_MARKER,
+    guidance: 'Use this block as the image input for this turn. Do not call file or image read tools for these images unless the user asks for file metadata.',
+    failureLabel: 'Preflight status',
+  };
+}
+
+function renderVisionContext({ config, images, summaryImages, skipped = [], failure, artifact, full = false, maxChars, source } = {}) {
+  const resolvedMaxChars = maxChars === undefined
+    ? full ? undefined : MAX_IMAGE_PREFLIGHT_CONTEXT_TEXT_CHARS
+    : maxChars;
+  if ((artifact?.handle || artifact?.groups?.length) && !full) {
+    return renderCompactVisionContext({ config, images, summaryImages, skipped, failure, artifact, maxChars: resolvedMaxChars });
+  }
+  const identity = visionContextIdentity(source);
+  const analyzedCount = failure ? summaryImages.length : images.length;
+  const sectionLimit = (value) => (full ? undefined : value);
+  const itemMaxChars = full ? null : 1200;
+  const lines = [
+    `<${identity.tag}>`,
+    `${identity.marker}`,
+    `Vision model: ${config.model}`,
+    `Images analyzed: ${analyzedCount}`,
+    identity.guidance,
+    'Evidence rule: omitted, unknown, unreadable, cropped, or not-visible details are unavailable, not absent. Only make identity, absence, count, measurement, condition, layout, chart, document, UI, relationship, or scene claims when direct evidence below supports them.',
+    'Evidence IDs are image-scoped in this block: use ids like image-1.E1, image-2.U1, image-3.N1, and image-4.I1 when citing image evidence.',
+  ];
+  if (!failure && images.length > 0 && summaryImages.length !== images.length) lines.push(`Vision summaries returned: ${summaryImages.length}`);
+  if (failure) lines.push(`${identity.failureLabel}: failed (${failure})`);
+  renderImageEvidenceIndex(lines, images);
+  if (skipped.length > 0) {
+    lines.push('', 'Skipped Images:');
+    for (const item of skipped) {
+      const name = safeImageDisplayName(item, item.label || item.origin || 'image');
+      lines.push(`- ${name}: ${item.reason}`);
+    }
+  }
+  renderVisionImageSection(lines, 'Overview', images, summaryImages, ['overview', 'summary'], 'No overview was returned.', { limit: sectionLimit(3), itemMaxChars });
+  renderVisionImageSection(lines, 'Image Type, Quality, And Scope', images, summaryImages, ['image_type', 'imageType', 'content_type', 'contentType', 'modality', 'quality_flags', 'qualityFlags', 'source_context', 'sourceContext', 'limits'], 'No type, quality, or scope notes were returned.', { limit: sectionLimit(8), itemMaxChars });
+  renderVisionImageSection(lines, 'Scene And Composition', images, summaryImages, ['scene_and_composition', 'sceneAndComposition', 'scene', 'scene_description', 'sceneDescription', 'setting', 'environment', 'composition', 'foreground', 'background', 'lighting', 'visual_style', 'visualStyle', 'style', 'medium', 'layout', 'regions', 'spatial_structure', 'spatialStructure'], 'No scene or composition details were returned.', { limit: sectionLimit(12), itemMaxChars });
+  renderVisionImageSection(lines, 'Subjects, Objects, And Entities', images, summaryImages, ['subjects_and_entities', 'subjectsAndEntities', 'subjects', 'objects', 'entities', 'people', 'living_subjects', 'livingSubjects', 'products', 'places', 'landmarks', 'brands'], 'No subject/object/entity details were returned.', { limit: sectionLimit(12), itemMaxChars });
+  renderVisionImageSection(lines, 'Attributes, Counts, And State', images, summaryImages, ['attributes_and_state', 'attributesAndState', 'attributes', 'colors', 'materials', 'condition', 'state', 'measurements', 'counts', 'counts_and_density', 'countsAndDensity', 'density'], 'No attribute, count, or state details were returned.', { limit: sectionLimit(10), itemMaxChars });
+  renderVisionImageSection(lines, 'Relationships And Activity', images, summaryImages, ['spatial_relationships', 'spatialRelationships', 'relationships', 'relative_positions', 'relativePositions', 'actions', 'events', 'activity', 'interactions', 'poses', 'motion'], 'No relationship or activity details were returned.', { limit: sectionLimit(10), itemMaxChars });
+  renderVisionImageSection(lines, 'Visible Text And Symbols', images, summaryImages, ['visible_text', 'visibleText', 'ocr_spans', 'ocrSpans', 'text_spans', 'textSpans', 'transcription', 'labels', 'captions', 'signage', 'symbols'], 'No visible text was returned.', { limit: sectionLimit(12), itemMaxChars });
+  renderVisionImageSection(lines, 'Structured Content And Data', images, summaryImages, ['structured_content', 'structuredContent', 'tables', 'charts', 'diagrams', 'documents', 'forms', 'receipts', 'maps', 'code', 'terminal', 'formulas', 'document_structure', 'documentStructure', 'data_entities', 'dataEntities', 'metrics'], 'No structured content or data details were returned.', { limit: sectionLimit(12), itemMaxChars });
+  renderVisionImageSection(lines, 'Domain-Specific Details', images, summaryImages, ['domain_specific_details', 'domainSpecificDetails', 'specialized_observations', 'specializedObservations', 'relevant_details', 'relevantDetails', 'ui_elements', 'uiElements', 'controls'], 'No domain-specific details were returned.', { limit: sectionLimit(10), itemMaxChars });
+  renderVisionImageSection(lines, 'Observed Facts', images, summaryImages, ['observed_facts', 'observedFacts', 'facts'], 'No structured observed facts were returned.', { required: true, includeImageMeta: true, limit: sectionLimit(12), emptyFallback: 'No supported images were analyzed.', itemMaxChars });
+  renderVisionImageSection(lines, 'Uncertainties And Limits', images, summaryImages, ['uncertainties', 'uncertainty', 'uncertainty_notes', 'uncertaintyNotes', 'unknowns'], 'No structured uncertainty notes were returned.', { limit: sectionLimit(8), itemMaxChars });
+  renderVisionImageSection(lines, 'Scoped Negative Evidence', images, summaryImages, ['negative_evidence', 'negativeEvidence', 'not_visible', 'notVisible'], 'No scoped negative evidence was returned.', { limit: sectionLimit(8), itemMaxChars });
+  renderVisionImageSection(lines, 'Inferences And Context', images, summaryImages, ['inferences', 'inference'], 'No structured inferences were returned.', { required: true, limit: sectionLimit(6), emptyFallback: 'No image inferences are available.', scopeCitationReferences: true, itemMaxChars });
+  renderVisionImageSection(lines, 'Guardrails For Text-Only Model', images, summaryImages, ['guardrails', 'critique_guardrails', 'critiqueGuardrails'], 'No image-specific guardrails were returned.', { limit: sectionLimit(6), scopeCitationReferences: true, itemMaxChars });
+  lines.push(`</${identity.tag}>`);
+  const rendered = lines.join('\n');
+  return Number.isFinite(resolvedMaxChars) ? truncateText(rendered, resolvedMaxChars) : rendered;
+}
+
+function safeImagePreflightSessionSegment(value) {
+  const text = String(value || '').trim().replace(/[^A-Za-z0-9_-]/g, '_').replace(/^_+|_+$/g, '').slice(0, 96);
+  return text || 'stronk-pi';
+}
+
+function imagePreflightSessionContext(event = {}, ctx = {}, options = {}, config = {}) {
+  const env = options.env ?? process.env;
+  const stateRoot = config.stateRoot || stronkStateRoot(env);
+  const sessionsRoot = join(stateRoot, 'agent', 'sessions');
+  const managerSessionId = sessionManagerString(ctx, 'getSessionId');
+  const managerSessionFile = sessionManagerString(ctx, 'getSessionFile');
+  const rawSessionId = firstString(
+    managerSessionId,
+    event.sessionId,
+    event.session_id,
+    nestedString(event, 'session', 'id'),
+    ctx.sessionId,
+    ctx.session_id,
+    nestedString(ctx, 'session', 'id'),
+    env.PI_SESSION_ID,
+    env.STRONK_PI_SWARM_RUN_ID,
+  );
+  const turnId = firstString(
+    event.turnId,
+    event.turn_id,
+    ctx.turnId,
+    ctx.turn_id,
+    env.PI_TURN_ID,
+    env.STRONK_PI_TURN_ID,
+  );
+  const transcriptPath = firstString(
+    managerSessionFile,
+    event.transcriptPath,
+    event.transcript_path,
+    nestedString(event, 'session', 'transcriptPath'),
+    ctx.transcriptPath,
+    ctx.transcript_path,
+    nestedString(ctx, 'session', 'transcriptPath'),
+    env.PI_TRANSCRIPT_PATH,
+    env.STRONK_PI_TRANSCRIPT_PATH,
+  );
+  const transcriptSessionId = transcriptPath && isAbsolute(transcriptPath)
+    ? basename(transcriptPath).replace(/\.[^.]+$/, '')
+    : '';
+  const sessionId = rawSessionId || transcriptSessionId || 'stronk-pi';
+  let artifactRoot = sessionsRoot;
+  if (transcriptPath && isAbsolute(transcriptPath)) {
+    const transcriptDir = resolve(dirname(transcriptPath));
+    if (pathIsWithinRoot(resolve(sessionsRoot), transcriptDir)) artifactRoot = transcriptDir;
+  }
+  return {
+    sessionId,
+    turnId,
+    sessionSegment: safeImagePreflightSessionSegment(sessionId),
+    artifactRoot,
+    hasSessionBinding: Boolean(rawSessionId || transcriptPath),
+  };
+}
+
+function imagePreflightArtifactDirectory(context = {}) {
+  const root = resolve(context.artifactRoot || join(stronkStateRoot(), 'agent', 'sessions'));
+  const base = resolve(root, 'image-preflight');
+  const directory = resolve(base, safeImagePreflightSessionSegment(context.sessionSegment || context.sessionId));
+  return pathIsWithinRoot(base, directory) ? directory : join(base, 'stronk-pi');
+}
+
+function imagePreflightArtifactInputGroups(images = [], summaryImages = [], groupSize = IMAGE_PREFLIGHT_ARTIFACT_IMAGES_PER_HANDLE) {
+  const safeGroupSize = Math.max(1, Math.trunc(Number(groupSize) || IMAGE_PREFLIGHT_ARTIFACT_IMAGES_PER_HANDLE));
+  const entries = images.map((image) => {
+    const summary = summaryForImage(image, images, summaryImages);
+    return {
+      image,
+      summary: summary && typeof summary === 'object'
+        ? { ...summary, label: firstString(summary.label, image.label) || image.label }
+        : { label: image.label },
+    };
+  });
+  const groups = [];
+  for (let index = 0; index < entries.length; index += safeGroupSize) {
+    const groupEntries = entries.slice(index, index + safeGroupSize);
+    const groupImages = groupEntries.map((entry) => entry.image);
+    groups.push({
+      images: groupImages,
+      summaryImages: groupEntries.map((entry) => entry.summary),
+      imageLabels: groupImages.map((image) => firstString(image.label)).filter(Boolean),
+      imageRange: imagePreflightImageRange(groupImages),
+    });
+  }
+  return groups;
+}
+
+function renderImagePreflightArtifactGroupHeader(group = {}, groups = []) {
+  const siblings = groups
+    .filter((candidate) => candidate.handle !== group.handle)
+    .map((candidate) => `${candidate.imageRange} handle=${candidate.handle}`)
+    .join('; ') || 'none';
+  return [
+    `Image Preflight Artifact Group ${group.groupIndex} of ${group.groupCount}`,
+    `Images in this handle: ${(group.imageLabels || []).join(', ') || 'none'}`,
+    `Sibling groups: ${siblings}`,
+    'If evidence cites labels outside this handle, read that sibling handle before relying on it.',
+  ].join('\n');
+}
+
+function publicImagePreflightArtifactGroup(group = {}) {
+  return {
+    handle: group.handle,
+    sessionId: group.sessionId,
+    turnId: group.turnId,
+    groupIndex: group.groupIndex,
+    groupCount: group.groupCount,
+    imageRange: group.imageRange,
+    imageLabels: group.imageLabels,
+    charLength: group.charLength,
+    truncated: group.truncated,
+  };
+}
+
+function writeImagePreflightArtifact({ config, images, summaryImages, skipped = [], failure }, event = {}, ctx = {}, options = {}) {
+  const writtenPaths = [];
+  try {
+    const context = imagePreflightSessionContext(event, ctx, options, config);
+    if (!context.hasSessionBinding) return undefined;
+    const directory = imagePreflightArtifactDirectory(context);
+    mkdirSync(directory, { recursive: true, mode: 0o700 });
+    const groupInputs = imagePreflightArtifactInputGroups(images, summaryImages);
+    if (groupInputs.length === 0) return undefined;
+    const directoryRoot = resolve(directory);
+    const groups = groupInputs.map((groupInput, index) => ({
+      ...groupInput,
+      handle: `image-preflight-${randomUUID()}`,
+      sessionId: context.sessionId,
+      turnId: context.turnId,
+      groupIndex: index + 1,
+      groupCount: groupInputs.length,
+    }));
+    const renderedGroups = groups.map((group) => {
+      const filePath = resolve(directory, `${group.handle}.txt`);
+      if (!pathIsWithinRoot(directoryRoot, filePath)) throw new Error('image preflight artifact path escaped session directory');
+      const body = renderVisionContext({
+        config,
+        images: group.images,
+        summaryImages: group.summaryImages,
+        skipped,
+        failure,
+        full: true,
+        maxChars: undefined,
+      });
+      const text = `${renderImagePreflightArtifactGroupHeader(group, groups)}\n\n${body}`;
+      return {
+        ...group,
+        filePath,
+        text,
+        charLength: text.length,
+        truncated: text.includes('[truncated by Stronk Pi]'),
+      };
+    });
+    for (const group of renderedGroups) {
+      writeFileSync(group.filePath, group.text, { encoding: 'utf8', mode: 0o600, flag: 'wx' });
+      writtenPaths.push(group.filePath);
+    }
+    const publicGroups = renderedGroups.map(publicImagePreflightArtifactGroup);
+    for (const group of renderedGroups) {
+      imagePreflightArtifactIndex.set(group.handle, {
+        ...publicImagePreflightArtifactGroup(group),
+        path: group.filePath,
+      });
+    }
+    return {
+      handle: publicGroups[0]?.handle,
+      sessionId: context.sessionId,
+      turnId: context.turnId,
+      batchSize: IMAGE_PREFLIGHT_ARTIFACT_IMAGES_PER_HANDLE,
+      groups: publicGroups,
+      charLength: publicGroups.reduce((total, group) => total + (Number(group.charLength) || 0), 0),
+      truncated: publicGroups.some((group) => group.truncated),
+    };
+  } catch {
+    for (const filePath of writtenPaths) {
+      try {
+        unlinkSync(filePath);
+      } catch {
+        // Best-effort cleanup; a stale temp artifact is safer than exposing raw image data.
+      }
+    }
+    return undefined;
+  }
+}
+
+function normalizeImagePreflightReadParams(params = {}) {
+  if (!params || typeof params !== 'object' || Array.isArray(params)) {
+    throw new Error(`${IMAGE_PREFLIGHT_READ_TOOL} input must be an object`);
+  }
+  const handle = typeof params.handle === 'string' ? params.handle.trim() : '';
+  if (!IMAGE_PREFLIGHT_ARTIFACT_HANDLE_PATTERN.test(handle)) {
+    throw new Error(`${IMAGE_PREFLIGHT_READ_TOOL} requires a valid image preflight handle`);
+  }
+  const offset = Math.max(0, Math.trunc(Number(params.offset) || 0));
+  const maxChars = clampedInteger(
+    firstPresent(params.max_chars, params.maxChars),
+    DEFAULT_IMAGE_PREFLIGHT_ARTIFACT_READ_CHARS,
+    1024,
+    MAX_IMAGE_PREFLIGHT_ARTIFACT_READ_CHARS,
+  );
+  return { handle, offset, maxChars };
+}
+
+function resolveImagePreflightArtifact(handle, ctx = {}, options = {}) {
+  const config = resolveVisionPreflightConfig(options);
+  const context = imagePreflightSessionContext({}, ctx, options, config);
+  if (!context.hasSessionBinding) {
+    throw new Error('image preflight artifact not found for this session');
+  }
+  const indexed = imagePreflightArtifactIndex.get(handle);
+  if (indexed?.path) {
+    if (indexed.sessionId && indexed.sessionId !== context.sessionId) {
+      throw new Error('image preflight artifact not found for this session');
+    }
+    return { path: indexed.path, metadata: indexed };
+  }
+  const directory = imagePreflightArtifactDirectory(context);
+  const filePath = resolve(directory, `${handle}.txt`);
+  if (!pathIsWithinRoot(resolve(directory), filePath)) {
+    throw new Error('image preflight artifact handle is outside the current session');
+  }
+  return { path: filePath, metadata: undefined };
+}
+
+function executeImagePreflightRead(params = {}, _signal, ctx = {}, options = {}) {
+  const normalized = normalizeImagePreflightReadParams(params);
+  let text;
+  let metadata;
+  try {
+    const artifact = resolveImagePreflightArtifact(normalized.handle, ctx, options);
+    metadata = artifact.metadata;
+    text = readFileSync(artifact.path, 'utf8');
+  } catch {
+    return toolResult(
+      'Image preflight artifact not found for this session.',
+      { tool: IMAGE_PREFLIGHT_READ_TOOL, handle: normalized.handle, found: false },
+    );
+  }
+  const totalChars = text.length;
+  const truncated = text.includes('[truncated by Stronk Pi]');
+  const start = Math.min(normalized.offset, totalChars);
+  const end = Math.min(totalChars, start + normalized.maxChars);
+  const chunk = text.slice(start, end);
+  const nextOffset = end < totalChars ? end : undefined;
+  const more = nextOffset === undefined ? '' : `\n\n[Call ${IMAGE_PREFLIGHT_READ_TOOL} with handle=${normalized.handle} and offset=${nextOffset} for more.]`;
+  return toolResult(
+    `Image Preflight Analysis Artifact\nHandle: ${normalized.handle}\nCharacters: ${start}-${end} of ${totalChars}\nArtifact capped: ${truncated ? 'yes' : 'no'}\n\n${chunk}${more}`,
+    {
+      tool: IMAGE_PREFLIGHT_READ_TOOL,
+      handle: normalized.handle,
+      found: true,
+      offset: start,
+      returnedChars: chunk.length,
+      totalChars,
+      truncated,
+      nextOffset,
+      groupIndex: metadata?.groupIndex,
+      groupCount: metadata?.groupCount,
+      imageRange: metadata?.imageRange,
+      imageLabels: metadata?.imageLabels,
+    },
+  );
+}
+
+function rewriteAnalyzedImageReferences(text, imagePreflight = {}) {
+  if (typeof text !== 'string' || !text) return text;
+  if (imagePreflight.block) return text;
+  const images = imagePreflight.collected?.images || [];
+  const skipped = imagePreflight.collected?.skipped || [];
+  if (!Array.isArray(images) && !Array.isArray(skipped)) return text;
+  const entries = [];
+  for (const image of images) {
+    entries.push({
+      image,
+      replacement: imageReferenceReplacement(image, imagePreflight.failure ? 'failed' : 'analyzed'),
+    });
+  }
+  for (const item of skipped) {
+    entries.push({
+      image: item,
+      replacement: imageReferenceReplacement(item, 'skipped'),
+    });
+  }
+  return rewriteImageReferenceAliases(text, entries);
+}
+
+function shouldSkipImagePreflight(event = {}) {
+  const text = typeof event.text === 'string' ? event.text : '';
+  const source = firstString(
+    event.source,
+    event.origin,
+    event.inputSource,
+    event.input_source,
+    nestedString(event, 'metadata', 'source'),
+    nestedString(event, 'metadata', 'origin'),
+  );
+  if (source && /extension|preflight|stronk-pi-image-vision-preflight/i.test(source)) return true;
+  if (event.stronkPiImagePreflight || event.imageVisionPreflight) return true;
+  if (event.metadata?.stronkPiImagePreflight || event.metadata?.imageVisionPreflight) return true;
+  return text.includes(`<${IMAGE_PREFLIGHT_CONTEXT_TAG}>`) || text.includes(IMAGE_PREFLIGHT_MARKER);
+}
+
+async function buildImageVisionPreflight(event = {}, ctx = {}, options = {}) {
+  if (shouldSkipImagePreflight(event)) return { contextBlock: '', stripImages: false, skipped: true };
+  if (modelSupportsImageInput(event, ctx, options)) return { contextBlock: '', stripImages: false, nativeImages: true };
+  const config = resolveVisionPreflightConfig(options);
+  if (!config.enabled) return { contextBlock: '', stripImages: false, skipped: true };
+  const collected = collectImageInputs(event, ctx, config, options);
+  if (collected.images.length === 0 && collected.skipped.length === 0) return { contextBlock: '', stripImages: false };
+
+  if (collected.images.length === 0) {
+    emitImagePreflightStatus(options, { phase: 'skipped', imageCount: 0, skippedCount: collected.skipped.length });
+    return {
+      contextBlock: renderVisionContext({ config, images: [], summaryImages: [], skipped: collected.skipped }),
+      stripImages: collected.rawImageCount > 0,
+      collected,
+    };
+  }
+
+  try {
+    emitImagePreflightStatus(options, {
+      phase: 'analyzing',
+      imageCount: collected.images.length,
+      skippedCount: collected.skipped.length,
+      model: config.model,
+    });
+    const attempt = await runImageVisionPreflightRequest(
+      collected.images,
+      config,
+      event,
+      ctx,
+      collected,
+      options,
+    ).catch((error) => retryImageVisionPreflightAfterTimeout(error, config, event, ctx, collected, options));
+    const summaryImages = attempt.summaryImages;
+    const artifact = writeImagePreflightArtifact({
+      config,
+      images: collected.images,
+      summaryImages,
+      skipped: collected.skipped,
+    }, event, ctx, options);
+    emitImagePreflightStatus(options, {
+      phase: 'complete',
+      imageCount: collected.images.length,
+      analyzedCount: summaryImages.length,
+      skippedCount: collected.skipped.length,
+      model: config.model,
+    });
+    return {
+      contextBlock: renderVisionContext({ config, images: collected.images, summaryImages, skipped: collected.skipped, artifact }),
+      stripImages: collected.rawImageCount > 0,
+      collected,
+      request: attempt.request,
+      retryRequests: attempt.requests,
+      retriedAfterTimeout: attempt.retriedAfterTimeout,
+      artifact,
+    };
+  } catch (error) {
+    const rawReason = error?.message ?? String(error);
+    const reason = safeImagePreflightFailureReason(rawReason);
+    emitImagePreflightStatus(options, {
+      phase: 'failed',
+      reason: rawReason,
+      failureMode: config.failureMode,
+      imageCount: collected.images.length,
+      skippedCount: collected.skipped.length,
+      model: config.model,
+    });
+    if (config.failureMode === 'block') {
+      return { block: true, reason, stripImages: collected.rawImageCount > 0, collected };
+    }
+    return {
+      contextBlock: renderVisionContext({
+        config,
+        images: collected.images,
+        summaryImages: [],
+        skipped: collected.skipped,
+        failure: reason,
+      }),
+      stripImages: collected.rawImageCount > 0,
+      collected,
+      failure: reason,
+    };
+  }
+}
+
+function normalizeImageReadPaths(value) {
+  if (value === undefined || value === null) return [];
+  if (!Array.isArray(value)) throw new Error('image_read paths must be an array of strings');
+  const paths = [];
+  for (const item of value) {
+    if (typeof item !== 'string' || !item.trim()) throw new Error('image_read paths must contain only non-empty strings');
+    paths.push(item);
+  }
+  return paths;
+}
+
+function normalizeImageReadParams(params = {}) {
+  if (!params || typeof params !== 'object' || Array.isArray(params)) {
+    throw new Error('image_read input must be an object');
+  }
+  const paths = normalizeImageReadPaths(params.paths);
+  const directory = typeof params.directory === 'string' && params.directory.trim() ? params.directory : undefined;
+  if (paths.length === 0 && !directory) throw new Error('image_read requires paths or directory');
+  if (paths.length > 1) {
+    throw new Error(`image_read reads exactly one image per call; received ${countLabel(paths.length, 'explicit path')}. Call image_read once per image with one exact path.`);
+  }
+  if (paths.length > 0 && directory) {
+    throw new Error('image_read reads exactly one image per call; pass either one exact path or one directory scan, not both.');
+  }
+  return {
+    paths,
+    directory,
+    recursive: params.recursive === true,
+    maxImages: 1,
+    question: typeof params.question === 'string' ? truncateText(params.question, 2000) : '',
+  };
+}
+
+function makeImageReadScanSkip(origin, reason, displayName) {
+  return makeImageSkip(origin, reason, {
+    label: origin,
+    displayName: displayName || origin,
+  });
+}
+
+function readBoundedImageReadDirectoryEntries(dir, limit) {
+  if (limit <= 0) return { entries: [], truncated: true };
+  let handle;
+  try {
+    handle = opendirSync(dir);
+  } catch {
+    return undefined;
+  }
+  const entries = [];
+  let truncated = false;
+  try {
+    while (entries.length < limit) {
+      const entry = handle.readSync();
+      if (!entry) break;
+      entries.push(entry);
+    }
+    truncated = Boolean(handle.readSync());
+  } catch {
+    return undefined;
+  } finally {
+    try {
+      handle.closeSync();
+    } catch {
+      // Directory scan cleanup is best-effort.
+    }
+  }
+  entries.sort((left, right) => left.name.localeCompare(right.name));
+  return { entries, truncated };
+}
+
+function scanImageReadDirectory(rawDirectory, params = {}, ctx = {}, env = process.env, options = {}) {
+  const cwd = resolve(firstString(ctx.cwd) || process.cwd());
+  const originalPath = cleanPathCandidate(rawDirectory);
+  const path = resolveImagePathCandidate(rawDirectory, cwd, env);
+  const enforceAllowedRoots = options.enforceAllowedRoots !== false;
+  if (!path) return { candidates: [], skipped: [makeImageSkip('directory', 'invalid image directory', { originalPath, displayName: originalPath || 'directory' })] };
+
+  let linkStats;
+  try {
+    linkStats = lstatSync(path);
+  } catch {
+    return { candidates: [], skipped: [makeImageSkip('directory', 'image directory does not exist', { path, originalPath, displayName: basename(originalPath || path) || 'directory' })] };
+  }
+  if (linkStats.isSymbolicLink()) {
+    return { candidates: [], skipped: [makeImageSkip('directory', 'symlink directory root skipped', { originalPath, displayName: basename(originalPath || path) || 'directory' })] };
+  }
+  if (imageCandidateHasHiddenSegment(path, cwd)) {
+    return { candidates: [], skipped: [makeImageSkip('directory', 'hidden directory root skipped', { originalPath, displayName: basename(originalPath || path) || 'directory' })] };
+  }
+
+  let realPath;
+  try {
+    realPath = realpathSync(path);
+  } catch {
+    return { candidates: [], skipped: [makeImageSkip('directory', 'image directory does not exist', { path, originalPath, displayName: basename(originalPath || path) || 'directory' })] };
+  }
+  if (pathHasProtectedSegment(realPath)) {
+    return { candidates: [], skipped: [makeImageSkip('directory', 'protected local path denied', { path: realPath, originalPath, displayName: basename(realPath) || 'directory' })] };
+  }
+  if (imageCandidateHasHiddenSegment(realPath, cwd)) {
+    return { candidates: [], skipped: [makeImageSkip('directory', 'hidden directory root skipped', { path: realPath, originalPath, displayName: basename(realPath) || 'directory' })] };
+  }
+  if (enforceAllowedRoots && !imagePathAllowed(realPath, cwd, env)) {
+    return { candidates: [], skipped: [makeImageSkip('directory', 'path outside allowed image roots', { path: realPath, originalPath, displayName: basename(realPath) || 'directory' })] };
+  }
+  let rootStats;
+  try {
+    rootStats = statSync(realPath);
+  } catch {
+    return { candidates: [], skipped: [makeImageSkip('directory', 'image directory is not readable', { path: realPath, originalPath, displayName: basename(realPath) || 'directory' })] };
+  }
+  if (!rootStats.isDirectory()) {
+    return { candidates: [], skipped: [makeImageSkip('directory', 'image directory is not a directory', { path: realPath, originalPath, displayName: basename(realPath) || 'directory' })] };
+  }
+
+  const recursive = params.recursive === true;
+  const candidates = [];
+  const skipped = [];
+  const queue = [{ dir: realPath }];
+  const visited = new Set([realPath]);
+  let entriesSeen = 0;
+  let dirsSeen = 0;
+
+  while (queue.length > 0) {
+    const current = queue.shift();
+    dirsSeen += 1;
+    if (dirsSeen > MAX_IMAGE_READ_DIRECTORY_DIRS) {
+      skipped.push(makeImageReadScanSkip('directory', `directory scan directory limit reached (${MAX_IMAGE_READ_DIRECTORY_DIRS})`, basename(realPath) || 'directory'));
+      break;
+    }
+
+    const remainingEntries = MAX_IMAGE_READ_DIRECTORY_ENTRIES - entriesSeen;
+    const scan = readBoundedImageReadDirectoryEntries(current.dir, remainingEntries);
+    if (!scan) {
+      skipped.push(makeImageReadScanSkip('directory', 'image directory is not readable', basename(current.dir) || 'directory'));
+      continue;
+    }
+    const { entries } = scan;
+    entriesSeen += entries.length;
+
+    for (const entry of entries) {
+      const child = join(current.dir, entry.name);
+      const displayName = entry.name;
+      if (entry.name.startsWith('.')) {
+        if (entry.isDirectory() || imageMimeSupported(mimeFromPath(entry.name))) {
+          skipped.push(makeImageReadScanSkip('directory', 'hidden path skipped', displayName));
+        }
+        continue;
+      }
+      if (pathHasProtectedSegment(child)) {
+        skipped.push(makeImageReadScanSkip('directory', 'protected local path denied', displayName));
+        continue;
+      }
+      if (entry.isSymbolicLink()) {
+        skipped.push(makeImageReadScanSkip('directory', 'symlink skipped during directory scan', displayName));
+        continue;
+      }
+      if (entry.isDirectory()) {
+        if (!recursive) continue;
+        let childReal;
+        try {
+          childReal = realpathSync(child);
+        } catch {
+          skipped.push(makeImageReadScanSkip('directory', 'image directory is not readable', displayName));
+          continue;
+        }
+        if (!pathIsInside(realPath, childReal) || (enforceAllowedRoots && !imagePathAllowed(childReal, cwd, env))) {
+          skipped.push(makeImageReadScanSkip('directory', enforceAllowedRoots ? 'directory escapes allowed image root' : 'directory escapes scan root', displayName));
+          continue;
+        }
+        if (pathHasProtectedSegment(childReal)) {
+          skipped.push(makeImageReadScanSkip('directory', 'protected local path denied', displayName));
+          continue;
+        }
+        if (imageCandidateHasHiddenSegment(childReal, realPath)) {
+          skipped.push(makeImageReadScanSkip('directory', 'hidden path skipped', displayName));
+          continue;
+        }
+        if (visited.has(childReal)) continue;
+        visited.add(childReal);
+        queue.push({ dir: childReal });
+        continue;
+      }
+      if (entry.isFile() && hasSupportedImageExtension(entry.name)) candidates.push(child);
+    }
+    if (scan.truncated) {
+      skipped.push(makeImageReadScanSkip('directory', `directory scan entry limit reached (${MAX_IMAGE_READ_DIRECTORY_ENTRIES})`, basename(realPath) || 'directory'));
+      return { candidates, skipped };
+    }
+  }
+  return { candidates, skipped };
+}
+
+function imageReadDirectoryMultipleRejection(scan = {}) {
+  const candidates = Array.isArray(scan.candidates) ? scan.candidates : [];
+  return {
+    reason: 'directory scan resolved multiple images',
+    message: `directory scan resolved ${countLabel(candidates.length, 'image candidate')}. Call image_read with one exact path or a narrower directory/input that resolves to one image.`,
+    mode: 'directory',
+    candidateCount: candidates.length,
+    candidateNames: candidates
+      .slice(0, MAX_IMAGE_READ_SKIPPED_DETAILS)
+      .map((candidate) => (
+        typeof candidate === 'string'
+          ? basename(cleanPathCandidate(candidate)) || 'image'
+          : safeImageDisplayName(candidate, candidate?.label || 'image')
+      )),
+    candidateNamesTruncated: candidates.length > MAX_IMAGE_READ_SKIPPED_DETAILS,
+  };
+}
+
+function imageReadMultipleImagesRejection(imageCount) {
+  return {
+    reason: 'multiple images resolved',
+    message: `${IMAGE_READ_TOOL} reads exactly one image per call; input resolved to ${countLabel(imageCount, 'image')}. Call image_read once per image with one exact path.`,
+    mode: 'resolved',
+    imageCount,
+  };
+}
+
+function collectImageReadInputs(params = {}, ctx = {}, config = resolveVisionPreflightConfig(), options = {}) {
+  const env = options.env ?? process.env;
+  const enforceAllowedRoots = imageReadShouldEnforceAllowedRoots(ctx, env);
+  const images = [];
+  const skipped = [];
+  const seen = new Map();
+  const addResult = (result) => {
+    if (result.image) {
+      const key = result.image.path ? `path:${result.image.path}` : `data:${result.image.mediaType}:${result.image.byteLength}:${result.image.data.slice(0, 32)}`;
+      const existing = seen.get(key);
+      if (existing) {
+        mergeImagePathAliases(existing, result.image);
+        return;
+      }
+      result.image.label = `image-${images.length + 1}`;
+      mergeImagePathAliases(result.image, result.image);
+      seen.set(key, result.image);
+      images.push(result.image);
+    } else if (result.skip) {
+      skipped.push(result.skip);
+    }
+  };
+
+  for (const [index, imagePath] of params.paths.entries()) {
+    addResult(normalizePathImage(`paths[${index}]`, imagePath, config, index + 1, ctx, env, { enforceAllowedRoots }));
+  }
+
+  if (params.directory) {
+    const scan = scanImageReadDirectory(params.directory, params, ctx, env, { enforceAllowedRoots });
+    skipped.push(...scan.skipped);
+    const pathOffset = params.paths.length;
+    for (const [index, imagePath] of scan.candidates.entries()) {
+      addResult(normalizePathImage(`directory[${index}]`, imagePath, config, pathOffset + index + 1, ctx, env, { enforceAllowedRoots }));
+    }
+  }
+
+  return {
+    images,
+    skipped,
+    discoveredCount: params.paths.length + (params.directory ? 1 : 0),
+  };
+}
+
+function imageReadDirectoryAliases(rawDirectory, ctx = {}, env = process.env) {
+  const aliases = [];
+  const originalPath = cleanPathCandidate(rawDirectory);
+  if (originalPath) aliases.push(originalPath);
+  const cwd = resolve(firstString(ctx.cwd) || process.cwd());
+  const resolvedPath = resolveImagePathCandidate(rawDirectory, cwd, env);
+  if (resolvedPath) {
+    aliases.push(resolvedPath);
+    try {
+      aliases.push(realpathSync(resolvedPath));
+    } catch {
+      // Best-effort path alias collection for redaction only.
+    }
+  }
+  return [...new Set(aliases.filter(Boolean))];
+}
+
+function sanitizeImageReadQuestion(question, params = {}, collected = { images: [], skipped: [] }, ctx = {}, env = process.env) {
+  const fallback = 'Image Read requested local image inspection.';
+  let text = typeof question === 'string' && question.trim() ? question.trim() : fallback;
+  text = redactImageDataText(text);
+  text = rewriteAnalyzedImageReferences(text, { collected });
+  if (params.directory) {
+    const directoryName = basename(cleanPathCandidate(params.directory)) || 'directory';
+    text = rewriteImageReferenceAliases(text, [{
+      image: { pathAliases: imageReadDirectoryAliases(params.directory, ctx, env), originalPath: params.directory },
+      replacement: `[directory; ${directoryName}]`,
+    }]);
+  }
+  text = redactLocalPathText(text);
+  text = redactImageDataText(text);
+  return truncateText(text, 2000);
+}
+
+function imageReadDetails(config, collected, summaryImages = [], failure) {
+  return {
+    tool: IMAGE_READ_TOOL,
+    model: config.model,
+    images: collected.images.map((image) => ({
+      label: image.label,
+      displayName: safeImageDisplayName(image, image.label),
+      origin: image.origin,
+      mediaType: image.mediaType,
+      byteLength: image.byteLength,
+    })),
+    imageCount: collected.images.length,
+    analyzedCount: failure ? summaryImages.length : collected.images.length,
+    summaryCount: summaryImages.length,
+    skippedCount: collected.skipped.length,
+    skipped: collected.skipped.slice(0, MAX_IMAGE_READ_SKIPPED_DETAILS).map((item) => ({
+      label: item.label || item.origin,
+      displayName: safeImageDisplayName(item, item.label || item.origin || 'image'),
+      origin: item.origin,
+      reason: item.reason,
+    })),
+    skippedTruncated: collected.skipped.length > MAX_IMAGE_READ_SKIPPED_DETAILS,
+    failure,
+  };
+}
+
+function imageReadToolText(contextBlock, collected, summaryImages = [], failure) {
+  const analyzed = failure ? summaryImages.length : collected.images.length;
+  const skipped = collected.skipped.length > 0 ? `; skipped ${countLabel(collected.skipped.length, 'image')}` : '';
+  const status = failure
+    ? `Image Read failed with bounded reason: ${failure}${skipped}.`
+    : `Image Read complete: analyzed ${countLabel(analyzed, 'image')}${skipped}.`;
+  return truncateText(`${status}\n\n${contextBlock}`, MAX_IMAGE_READ_OUTPUT_CHARS);
+}
+
+function imageReadRejectionResult(config, rejection = {}, collected = { images: [], skipped: [] }) {
+  const reason = rejection.reason || 'invalid image_read input';
+  const message = truncateText(rejection.message || `${IMAGE_READ_TOOL} reads exactly one image per call.`, 1000);
+  return {
+    ...toolResult(
+      `Image Read rejected: ${message}`,
+      {
+        ...imageReadDetails(config, collected, [], reason),
+        rejected: true,
+        rejection: {
+          reason,
+          mode: rejection.mode,
+          candidateCount: rejection.candidateCount,
+          candidateNames: rejection.candidateNames,
+          candidateNamesTruncated: rejection.candidateNamesTruncated,
+          imageCount: rejection.imageCount,
+        },
+      },
+    ),
+    isError: true,
+  };
+}
+
+async function executeImageRead(params = {}, signal, ctx = {}, options = {}) {
+  const config = resolveVisionPreflightConfig(options);
+  let normalized;
+  try {
+    normalized = normalizeImageReadParams(params);
+  } catch (error) {
+    return imageReadRejectionResult(
+      { ...config, maxImages: 1 },
+      { reason: 'invalid image_read input', message: error?.message || 'image_read input is invalid', mode: 'input' },
+      { images: [], skipped: [] },
+    );
+  }
+  const toolConfig = { ...config, maxImages: 1 };
+
+  if (!toolConfig.enabled) {
+    const text = 'Image Read unavailable: image_preflight is disabled.';
+    return toolResult(text, imageReadDetails(toolConfig, { images: [], skipped: [] }, [], 'vision preflight unavailable'));
+  }
+
+  const collected = collectImageReadInputs(normalized, ctx, toolConfig, options);
+
+  if (collected.images.length === 0) {
+    const contextBlock = renderVisionContext({
+      config: toolConfig,
+      images: [],
+      summaryImages: [],
+      skipped: collected.skipped,
+      source: IMAGE_READ_TOOL,
+    });
+    return toolResult(imageReadToolText(contextBlock, collected, []), imageReadDetails(toolConfig, collected, []));
+  }
+
+  if (collected.images.length > 1) {
+    const rejection = normalized.directory
+      ? imageReadDirectoryMultipleRejection({ candidates: collected.images })
+      : imageReadMultipleImagesRejection(collected.images.length);
+    return imageReadRejectionResult(toolConfig, rejection, collected);
+  }
+
+  try {
+    const request = buildVisionRequest(
+      collected.images,
+      toolConfig,
+      {
+        text: sanitizeImageReadQuestion(normalized.question, normalized, collected, ctx, options.env ?? process.env),
+        source: IMAGE_READ_TOOL,
+      },
+      ctx,
+      collected,
+    );
+    const result = await withVisionTimeout(toolConfig.timeoutMs, signal || ctx.signal, (visionSignal) => {
+      request.signal = visionSignal;
+      return invokeVisionPreflight(request, ctx, options);
+    });
+    const summaryImages = sanitizeVisionSummaries(normalizeVisionSummary(result), collected);
+    const contextBlock = renderVisionContext({
+      config: toolConfig,
+      images: collected.images,
+      summaryImages,
+      skipped: collected.skipped,
+      source: IMAGE_READ_TOOL,
+    });
+    return toolResult(imageReadToolText(contextBlock, collected, summaryImages), imageReadDetails(toolConfig, collected, summaryImages));
+  } catch (error) {
+    const reason = safeImagePreflightFailureReason(error?.message ?? String(error));
+    const contextBlock = renderVisionContext({
+      config: toolConfig,
+      images: collected.images,
+      summaryImages: [],
+      skipped: collected.skipped,
+      failure: reason,
+      source: IMAGE_READ_TOOL,
+    });
+    return toolResult(
+      imageReadToolText(contextBlock, collected, [], reason),
+      imageReadDetails(toolConfig, collected, [], reason),
+    );
+  }
 }
 
 function piHookContext(event = {}, ctx = {}) {
@@ -812,13 +3816,130 @@ async function emitCodexHook(hookEventName, event = {}, ctx = {}) {
 }
 
 function notifyBlock(ctx, reason) {
-  if (ctx?.hasUI && ctx.ui && typeof ctx.ui.notify === 'function') {
+  notifyUi(ctx, reason, 'warning');
+}
+
+function notifyUi(ctx, message, kind = 'info') {
+  if (ctx?.hasUI && ctx.ui && typeof ctx.ui.notify === 'function' && typeof message === 'string' && message.trim()) {
     try {
-      ctx.ui.notify(reason, 'warning');
+      ctx.ui.notify(message, kind);
+      return true;
     } catch {
       // UI notifications are advisory.
     }
   }
+  return false;
+}
+
+const activeImagePreflightUi = new WeakMap();
+
+function imagePreflightUiMessage(status = {}) {
+  const imageCount = Number(status.imageCount ?? status.analyzedCount ?? 0);
+  return `Analyzing ${countLabel(imageCount, 'image')} with vision preflight`;
+}
+
+function themeText(theme, key, text) {
+  if (theme && typeof theme.fg === 'function') {
+    try {
+      return theme.fg(key, text);
+    } catch {
+      // Theme helpers are advisory.
+    }
+  }
+  return text;
+}
+
+function createImagePreflightWidget(status = {}) {
+  const message = imagePreflightUiMessage(status);
+  return (tui, theme) => {
+    let frameIndex = 0;
+    let disposed = false;
+    const renderLine = () => {
+      const frame = IMAGE_PREFLIGHT_UI_FRAMES[frameIndex % IMAGE_PREFLIGHT_UI_FRAMES.length] || '';
+      return `${themeText(theme, 'accent', frame)} ${themeText(theme, 'muted', message)}`;
+    };
+    const interval = setInterval(() => {
+      if (disposed) return;
+      frameIndex = (frameIndex + 1) % IMAGE_PREFLIGHT_UI_FRAMES.length;
+      if (typeof tui?.requestRender === 'function') tui.requestRender();
+    }, IMAGE_PREFLIGHT_UI_INTERVAL_MS);
+    if (typeof interval?.unref === 'function') interval.unref();
+    return {
+      render: () => [renderLine()],
+      invalidate: () => {},
+      dispose: () => {
+        disposed = true;
+        clearInterval(interval);
+      },
+    };
+  };
+}
+
+function startImagePreflightUi(ctx, status = {}) {
+  const ui = ctx?.ui;
+  if (!ctx?.hasUI || !ui || typeof ui !== 'object') return false;
+  stopImagePreflightUi(ctx);
+  const tuiMode = ctx.mode === 'tui' || ctx.mode === 'interactive';
+  const message = imagePreflightUiMessage(status);
+  const state = { status: false, widget: false };
+
+  if (typeof ui.setStatus === 'function') {
+    try {
+      ui.setStatus(IMAGE_PREFLIGHT_UI_KEY, `image vision: ${message}`);
+      state.status = true;
+    } catch {
+      // UI status is advisory.
+    }
+  }
+
+  if (tuiMode && typeof ui.setWidget === 'function') {
+    try {
+      ui.setWidget(IMAGE_PREFLIGHT_UI_KEY, createImagePreflightWidget(status), { placement: 'belowEditor' });
+      state.widget = true;
+    } catch {
+      // Widgets are advisory.
+    }
+  }
+
+  if (state.status || state.widget) {
+    activeImagePreflightUi.set(ui, state);
+    return true;
+  }
+  return false;
+}
+
+function stopImagePreflightUi(ctx) {
+  const ui = ctx?.ui;
+  if (!ui || typeof ui !== 'object') return false;
+  const state = activeImagePreflightUi.get(ui);
+  if (!state) return false;
+  if (state.widget && typeof ui.setWidget === 'function') {
+    try {
+      ui.setWidget(IMAGE_PREFLIGHT_UI_KEY, undefined);
+    } catch {
+      // UI cleanup is best-effort.
+    }
+  }
+  if (state.status && typeof ui.setStatus === 'function') {
+    try {
+      ui.setStatus(IMAGE_PREFLIGHT_UI_KEY, undefined);
+    } catch {
+      // UI cleanup is best-effort.
+    }
+  }
+  activeImagePreflightUi.delete(ui);
+  return true;
+}
+
+function notifyImagePreflightStatus(ctx, status = {}) {
+  const message = formatImagePreflightStatus(status);
+  if (!message) return false;
+  if (status.phase === 'analyzing') {
+    startImagePreflightUi(ctx, status);
+  } else if (status.phase === 'complete' || status.phase === 'failed' || status.phase === 'skipped') {
+    stopImagePreflightUi(ctx);
+  }
+  return notifyUi(ctx, message, status.phase === 'failed' || status.phase === 'skipped' ? 'warning' : 'info');
 }
 
 function pathIsInside(root, target) {
@@ -1310,13 +4431,16 @@ async function handleInput(event, ctx = {}) {
     notifyBlock(ctx, decision.reason);
     return { action: 'handled' };
   }
-  if (typeof event?.text !== 'string') return undefined;
+  if (typeof event?.text !== 'string' && !Array.isArray(event?.images)) return undefined;
+  const originalText = typeof event?.text === 'string' ? event.text : '';
 
-  let skillContext;
+  let skillContext = { blocks: [] };
   try {
-    skillContext = buildSkillInjectionContext(event.text, {
-      cwd: firstString(event.cwd, ctx.cwd) || process.cwd(),
-    });
+    if (typeof event?.text === 'string') {
+      skillContext = buildSkillInjectionContext(event.text, {
+        cwd: firstString(event.cwd, ctx.cwd) || process.cwd(),
+      });
+    }
   } catch (error) {
     const reason = error?.message ?? String(error);
     notifyBlock(ctx, reason);
@@ -1329,11 +4453,23 @@ async function handleInput(event, ctx = {}) {
   }
   appendedContexts.push(...skillContext.blocks);
 
-  if (appendedContexts.length > 0) {
+  const imagePreflight = await buildImageVisionPreflight(event, ctx, {
+    onStatus: (status) => notifyImagePreflightStatus(ctx, status),
+  });
+  if (imagePreflight.block) {
+    return { action: 'handled' };
+  }
+  if (imagePreflight.contextBlock) appendedContexts.push(imagePreflight.contextBlock);
+
+  if (appendedContexts.length > 0 || imagePreflight.stripImages) {
+    const baseText = rewriteAnalyzedImageReferences(originalText, imagePreflight);
+    const text = appendedContexts.length > 0
+      ? `${baseText}${baseText ? '\n\n' : ''}${appendedContexts.join('\n\n')}`
+      : baseText;
     return {
       action: 'transform',
-      text: `${event.text}\n\n${appendedContexts.join('\n\n')}`,
-      images: event.images,
+      text,
+      images: imagePreflight.stripImages ? [] : event.images,
     };
   }
   return undefined;
@@ -4927,6 +8063,39 @@ function registerStronkTools(pi, state = { todos: [] }) {
     });
   }
   pi.registerTool({
+    name: IMAGE_PREFLIGHT_READ_TOOL,
+    label: 'Image Preflight Read',
+    description: 'Read a session-scoped extended text artifact produced by prompt-time image vision preflight for text-only models.',
+    promptSnippet: 'Read extended prompt-time image preflight analysis by handle',
+    promptGuidelines: [
+      'Use image_preflight_read only when a prompt-time image preflight block gives a handle and the bounded inline block omits needed image detail.',
+      'Pass the exact handle from the preflight block; use offset only to continue a previous chunk.',
+      'This tool returns sanitized text analysis, not raw image data.',
+    ],
+    parameters: imagePreflightReadSchema,
+    execute: async (...args) => {
+      const { params, signal, ctx } = normalizeToolArgs(args);
+      return executeImagePreflightRead(params, signal, ctx);
+    },
+  });
+  pi.registerTool({
+    name: IMAGE_READ_TOOL,
+    label: 'Image Read',
+    description: 'Read exactly one local image file for text-only models by routing it through the configured vision preflight model. Native multimodal models should use normal image handling.',
+    promptSnippet: 'Read one local image with the configured vision preflight model',
+    promptGuidelines: [
+      'Use image_read when a text-only model discovers local image files after the prompt starts.',
+      'Call image_read once per image; pass one exact path when possible.',
+      'Use directory only when one bounded folder scan is expected to resolve exactly one image.',
+      'Do not use image_read for native multimodal models unless explicit text-only image evidence is needed.',
+    ],
+    parameters: imageReadSchema,
+    execute: async (...args) => {
+      const { params, signal, ctx } = normalizeToolArgs(args);
+      return executeImageRead(params, signal, ctx);
+    },
+  });
+  pi.registerTool({
     name: 'glob',
     label: 'glob',
     description: 'Find files by glob pattern inside the current project. This is the Stronk Pi OpenCode-compatible glob tool.',
@@ -5203,6 +8372,35 @@ export const internals = {
   codexHookInput,
   parseCodexHookStdout,
   emitCodexHook,
+  parseTomlSections,
+  resolveVisionPreflightConfig,
+  resolveVisionProviderConfig,
+  activeModelRef,
+  modelSupportsImageInput,
+  extractImagePathCandidates,
+  collectImageInputs,
+  buildVisionRequest,
+  buildOpenAIVisionPayload,
+  invokeOpenAICompatibleVisionPreflight,
+  normalizeVisionSummary,
+  safeImagePreflightFailureReason,
+  formatImagePreflightStatus,
+  createImagePreflightWidget,
+  startImagePreflightUi,
+  stopImagePreflightUi,
+  notifyImagePreflightStatus,
+  renderVisionContext,
+  imageVisionOutputTokens,
+  imagePreflightSessionContext,
+  writeImagePreflightArtifact,
+  normalizeImagePreflightReadParams,
+  executeImagePreflightRead,
+  rewriteAnalyzedImageReferences,
+  buildImageVisionPreflight,
+  normalizeImageReadParams,
+  scanImageReadDirectory,
+  collectImageReadInputs,
+  executeImageRead,
   parseSkillRoots,
   loadSkillInventory,
   loadSkillCatalog,

@@ -1,0 +1,51 @@
+{
+  "skill_name": "stronk-pi-plugin-release",
+  "evals": [
+    {
+      "id": 1,
+      "prompt": "In stronk-pi-plugin, prepare plugin release 0.3.0 and hand it off to distribution.",
+      "expected_output": "Uses stronk-pi-plugin-release, separates bump, PR, publish, attestation, and handoff steps, and requires exact confirmation before workflow dispatch.",
+      "files": [],
+      "expectations": [
+        "Uses npm run version:bump -- 0.3.0.",
+        "Runs npm ci --ignore-scripts and npm run check.",
+        "Stops at the PR and CI gate before publishing unless merge state is confirmed.",
+        "Verifies attestation before handoff to stronk-pi."
+      ]
+    },
+    {
+      "id": 2,
+      "prompt": "Publish the Stronk Pi plugin release v0.3.0 from main.",
+      "expected_output": "Uses stronk-pi-plugin-release, checks package version and merge preconditions, and requires exact operator confirmation before dispatching GitHub Actions.",
+      "files": [],
+      "expectations": [
+        "Uses gh workflow run release.yml --ref main -f version=0.3.0 only after confirmation.",
+        "Mentions gh run list and gh run watch as follow-up monitoring commands.",
+        "Does not import the plugin into the distribution manifest."
+      ]
+    },
+    {
+      "id": 3,
+      "prompt": "Download the plugin release artifacts and verify the attestation before handoff.",
+      "expected_output": "Uses stronk-pi-plugin-release, downloads the tarball, SHA256SUMS.txt, and BUILD-MANIFEST.json, verifies attestation, and reports the distribution import step.",
+      "files": [],
+      "expectations": [
+        "Uses gh release download with the stronk-pi-plugin repo.",
+        "Downloads BUILD-MANIFEST.json.",
+        "Runs gh attestation verify on the versioned tarball.",
+        "Says stronk-pi imports the BUILD-MANIFEST.json separately."
+      ]
+    },
+    {
+      "id": 4,
+      "prompt": "Import the plugin BUILD-MANIFEST into the stronk-pi distribution manifest.",
+      "expected_output": "Does not use stronk-pi-plugin-release for the import. Routes distribution manifest import work to the stronk-pi release skill.",
+      "files": [],
+      "expectations": [
+        "States that distribution manifest import belongs in stronk-pi.",
+        "Does not run scripts/import-plugin-release.py from the plugin repo.",
+        "Does not modify package.json or package-lock.json."
+      ]
+    }
+  ]
+}

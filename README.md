@@ -27,8 +27,26 @@ takes that name.
 - Pi child write-swarms in real repos require launcher-owned SQLite task claims
   with explicit `OWNERSHIP`; `--scratch-write` is retained for guard tests.
 - Stronk-owned OpenCode parity tools registered here: `glob`, `todowrite`,
-  `todoread`, `question`, `web_search`, `code_search`, and guarded
-  `fetch_content`.
+  `todoread`, `question`, `image_read`, `image_preflight_read`, `web_search`,
+  `code_search`, and guarded `fetch_content`.
+- Prompt-time image preflight keeps the inline block bounded, but when a
+  Stronk Pi session binding is available it also saves an extended bounded
+  sanitized text analysis as a private session artifact.
+  The vision provider still receives one multi-image request; only the saved
+  readback artifacts are split into three-image groups.
+  The inline block is only a compact artifact index: image labels, safe
+  filenames, MIME/size hints, and opaque handles grouped at up to three images
+  per handle.
+  Text-only models must call `image_preflight_read` with the relevant handle
+  before making visual claims, without receiving raw image bytes, base64, or
+  unnecessary absolute local paths.
+- `image_read` is the explicit agentic image-reading tool for text-only models
+  that discover local image files after the prompt starts.
+  It reads exactly one image per call, using either one explicit path or one
+  bounded directory scan that resolves exactly one image.
+  It reuses the configured image vision preflight model route, byte limit,
+  timeout, safe failure classification, Image Evidence Index, and
+  image-scoped evidence IDs.
 - Stronk-owned `web_search` supports exactly `exa`, `brave`, `tavily`, and
   `gemini` via `STRONK_PI_SEARCH_PROVIDER`. Provider keys are read only from
   local environment variables: `EXA_API_KEY`, `BRAVE_SEARCH_API_KEY`,
@@ -71,8 +89,8 @@ takes that name.
   search-result URLs alone, and do not run automatic background page-content
   fetches. Finished reviews label kept results as `fetched`, `fetch-failed`, or
   `snippet-only`; treat `snippet-only` as a prompt to fetch before citing.
-- `stronkpi` loads the installed plugin artifact at
-  `~/.stronk-pi/artifacts/stronk-pi-plugin-0.1.0/package/src/index.mjs`.
+- `stronkpi` loads the installed plugin artifact whose directory version
+  matches this repo's `package.json` version.
   After changing this repo's runtime tool surface, refresh the setup-managed
   artifact and verify `stronkpi --validate-only` plus `stronkpi --diagnose`.
 - `stronk_subagent` requires an explicit role manifest from the harness. The
@@ -95,3 +113,27 @@ Run checks:
 npm test
 npm run lint:security
 ```
+
+## Release Bump
+
+Prepare a plugin version bump in this repo:
+
+```bash
+npm run version:bump -- 0.2.0
+npm ci --ignore-scripts
+npm run check
+```
+
+After the bump PR is merged, publish the release from GitHub Actions:
+
+```bash
+gh workflow run release.yml --ref main -f version=0.2.0
+```
+
+The release workflow verifies that the workflow input matches `package.json`,
+packs the plugin, writes `BUILD-MANIFEST.json`, generates an attestation, and
+publishes the immutable `stronk-pi-plugin-v<version>` release.
+
+The `stronk-pi` distribution repo consumes that release in a separate PR.
+Agents can also use the project-scope `stronk-pi-plugin-release` skill in this
+repo.
