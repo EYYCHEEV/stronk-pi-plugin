@@ -2173,7 +2173,7 @@ async function invokeOpenAICompatibleVisionPreflight(request, ctx = {}, options 
   const env = options.env ?? process.env;
   const resolvedProvider = resolveVisionProviderConfig(request.model, options);
   if (!resolvedProvider) throw new Error(`vision model not found in models.json: ${request.model}`);
-  const { providerName, providerConfig } = resolvedProvider;
+  const { providerName, providerConfig, modelConfig } = resolvedProvider;
   if (!providerUsesOpenAICompatibleChat(providerConfig)) {
     throw new Error(`vision provider ${providerName} is not OpenAI-compatible`);
   }
@@ -2190,6 +2190,7 @@ async function invokeOpenAICompatibleVisionPreflight(request, ctx = {}, options 
   const response = await fetchFn(openAIChatCompletionsUrl(baseUrl), {
     method: 'POST',
     headers: {
+      ...providerStaticHeaders(providerConfig, modelConfig),
       authorization: `Bearer ${apiKey.value}`,
       'content-type': 'application/json',
     },

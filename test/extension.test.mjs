@@ -2768,6 +2768,13 @@ test('image preflight does not expand folders into image inputs', async () => {
 
 test('image_read analyzes explicit local image paths through the configured vision route', async () => {
   const root = mkdtempSync(join(tmpdir(), 'stronk-pi-image-read-path.'));
+  const stateRoot = join(root, '.stronk-pi');
+  mkdirSync(join(stateRoot, 'config'), { recursive: true });
+  writeFileSync(join(stateRoot, 'config', 'defaults.toml'), [
+    '[image_preflight]',
+    'model = "vision-provider/vision-large"',
+    '',
+  ].join('\n'));
   const imagePath = realpathSync(writePng(root, 'tool-screenshot.png'));
   const calls = [];
   const tools = [];
@@ -2777,7 +2784,7 @@ test('image_read analyzes explicit local image paths through the configured visi
   });
   const imageRead = tools.find((tool) => tool.name === 'image_read');
 
-  const result = await withEnv({ STRONK_PI_STATE_ROOT: join(root, '.stronk-pi') }, async () => imageRead.execute(
+  const result = await withEnv({ STRONK_PI_STATE_ROOT: stateRoot }, async () => imageRead.execute(
     'tool-call-image-read',
     {
       paths: [imagePath],
@@ -2802,7 +2809,7 @@ test('image_read analyzes explicit local image paths through the configured visi
 
   const text = result.content[0].text;
   assert.equal(calls.length, 1);
-  assert.equal(calls[0].model, 'kimi-coding/kimi-for-coding:xhigh');
+  assert.equal(calls[0].model, 'vision-provider/vision-large');
   assert.equal(calls[0].messages[0].content.filter((part) => part.type === 'image').length, 1);
   assert.match(calls[0].messages[0].content[0].text, /\[image-1; tool-screenshot\.png]/);
   assert.equal(calls[0].messages[0].content[0].text.includes(imagePath), false);
@@ -3418,8 +3425,19 @@ test('image_read can call configured OpenAI-compatible vision provider without p
         api: 'openai-completions',
         apiKey: '$VISION_API_KEY',
         baseUrl: 'https://vision.example/v1',
+        headers: {
+          'x-provider-static': 'provider-header',
+          'x-shared-static': 'provider-value',
+        },
         models: [
-          { id: 'vision-large', input: ['text', 'image'] },
+          {
+            id: 'vision-large',
+            input: ['text', 'image'],
+            headers: {
+              'x-model-static': 'model-header',
+              'x-shared-static': 'model-value',
+            },
+          },
         ],
       },
     },
@@ -3475,6 +3493,9 @@ test('image_read can call configured OpenAI-compatible vision provider without p
 
   assert.equal(fetchFn.calls.length, 1);
   assert.equal(fetchFn.calls[0].url, 'https://vision.example/v1/chat/completions');
+  assert.equal(fetchFn.calls[0].init.headers['x-provider-static'], 'provider-header');
+  assert.equal(fetchFn.calls[0].init.headers['x-model-static'], 'model-header');
+  assert.equal(fetchFn.calls[0].init.headers['x-shared-static'], 'model-value');
   const payload = requestBody(fetchFn.calls[0]);
   assert.equal(payload.model, 'vision-large');
   assert.equal(payload.max_tokens, 4096);
@@ -3726,11 +3747,18 @@ test('image_read returns bounded failure context without raw provider payloads o
 
 test('text-only image preflight injects structured context and strips raw images', async () => {
   const root = mkdtempSync(join(tmpdir(), 'stronk-pi-image-preflight.'));
+  const stateRoot = join(root, '.stronk-pi');
+  mkdirSync(join(stateRoot, 'config'), { recursive: true });
+  writeFileSync(join(stateRoot, 'config', 'defaults.toml'), [
+    '[image_preflight]',
+    'model = "vision-provider/vision-large"',
+    '',
+  ].join('\n'));
   const imagePath = writePng(root);
   const calls = [];
   const notices = [];
 
-  const result = await withEnv(allowingPromptHookEnv({ STRONK_PI_STATE_ROOT: join(root, '.stronk-pi') }), async () => (
+  const result = await withEnv(allowingPromptHookEnv({ STRONK_PI_STATE_ROOT: stateRoot }), async () => (
     internals.handleInput(
       {
         text: `What changed in ${imagePath}?`,
@@ -3776,7 +3804,7 @@ test('text-only image preflight injects structured context and strips raw images
   assert.match(result.text, /workflow likely completed successfully/);
   assert.doesNotMatch(result.text, new RegExp(PNG_BASE64.slice(0, 24)));
   assert.equal(calls.length, 1);
-  assert.equal(calls[0].model, 'kimi-coding/kimi-for-coding:xhigh');
+  assert.equal(calls[0].model, 'vision-provider/vision-large');
   assert.equal(calls[0].messages[0].content.filter((part) => part.type === 'image').length, 2);
   assert.deepEqual(notices, [
     ['info', 'Stronk Pi detected 2 images for a text-only model; analyzing with vision preflight.'],
@@ -4990,18 +5018,30 @@ test('image preflight can call configured OpenAI-compatible vision provider with
   mkdirSync(join(stateRoot, 'config'), { recursive: true });
   writeFileSync(join(stateRoot, 'agent', 'models.json'), JSON.stringify({
     providers: {
-      'kimi-coding': {
-        name: 'Kimi Coding',
+      'vision-provider': {
+        name: 'Vision Provider',
         api: 'openai-completions',
-        apiKey: '$KIMI_API_KEY',
+        apiKey: '$VISION_API_KEY',
         baseUrl: 'https://vision.example/v1',
+        headers: {
+          'x-provider-static': 'provider-header',
+          'x-shared-static': 'provider-value',
+        },
         compat: {
           maxTokensField: 'max_tokens',
           supportsDeveloperRole: false,
           supportsStore: false,
         },
         models: [
-          { id: 'kimi-for-coding', input: ['text', 'image'], maxTokens: 65536 },
+          {
+            id: 'vision-large',
+            input: ['text', 'image'],
+            maxTokens: 65536,
+            headers: {
+              'x-model-static': 'model-header',
+              'x-shared-static': 'model-value',
+            },
+          },
         ],
       },
       'alibaba-coding': {
@@ -5012,7 +5052,7 @@ test('image preflight can call configured OpenAI-compatible vision provider with
   writeFileSync(join(stateRoot, 'config', 'defaults.toml'), [
     '[image_preflight]',
     'enabled = true',
-    'model = "kimi-coding/kimi-for-coding:xhigh"',
+    'model = "vision-provider/vision-large"',
     '',
   ].join('\n'));
   const linuxEtcPath = '/etc/passwd';
@@ -5038,13 +5078,12 @@ test('image preflight can call configured OpenAI-compatible vision provider with
 
   const result = await withEnv(allowingPromptHookEnv({
     STRONK_PI_STATE_ROOT: stateRoot,
-    KIMI_API_KEY: 'test-kimi-generic-key',
-    KIMI_CODE_API_KEY: 'fallback-kimi-code-key',
-	  }), async () => internals.handleInput(
-	    {
-	      text: `What is in this image? Compare with ${linuxEtcPath}, ${linuxRootPath}, and ${rawGifDataUrl}.`,
-	      model: 'alibaba-coding/qwen3-coder-plus',
-	      images: [{ source: { type: 'base64', mediaType: 'image/png', data: PNG_BASE64 } }],
+    VISION_API_KEY: 'vision-test-key',
+  }), async () => internals.handleInput(
+    {
+      text: `What is in this image? Compare with ${linuxEtcPath}, ${linuxRootPath}, and ${rawGifDataUrl}.`,
+      model: 'alibaba-coding/qwen3-coder-plus',
+      images: [{ source: { type: 'base64', mediaType: 'image/png', data: PNG_BASE64 } }],
     },
     {
       cwd: root,
@@ -5058,9 +5097,13 @@ test('image preflight can call configured OpenAI-compatible vision provider with
   assert.equal(fetchFn.calls.length, 1);
   assert.equal(fetchFn.calls[0].url, 'https://vision.example/v1/chat/completions');
   assert.equal(fetchFn.calls[0].init.method, 'POST');
-  assert.equal(fetchFn.calls[0].init.headers.authorization, 'Bearer test-kimi-generic-key');
+  assert.equal(fetchFn.calls[0].init.headers.authorization, 'Bearer vision-test-key');
+  // Static coverage only; each replacement provider still needs an API-keyed smoke test.
+  assert.equal(fetchFn.calls[0].init.headers['x-provider-static'], 'provider-header');
+  assert.equal(fetchFn.calls[0].init.headers['x-model-static'], 'model-header');
+  assert.equal(fetchFn.calls[0].init.headers['x-shared-static'], 'model-value');
   const payload = requestBody(fetchFn.calls[0]);
-  assert.equal(payload.model, 'kimi-for-coding');
+  assert.equal(payload.model, 'vision-large');
   assert.equal(payload.max_tokens, 4096);
   assert.equal(payload.messages[0].role, 'system');
   assert.equal(payload.messages[1].role, 'user');
