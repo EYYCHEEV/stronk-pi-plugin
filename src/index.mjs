@@ -1162,10 +1162,6 @@ function imagePathAllowed(path, cwd, env = process.env) {
   });
 }
 
-function imagePermissionModeCandidates(ctx = {}, env = process.env) {
-  return imagePermissionContextCandidates(ctx).concat(imagePermissionEnvCandidates(env));
-}
-
 function normalizeImagePermissionModes(values = []) {
   return values
     .filter((value) => typeof value === 'string' && value.trim())
@@ -1191,7 +1187,7 @@ function imagePermissionEnvCandidates(env = process.env) {
   ];
 }
 
-function imageAllowedRootPolicy(ctx = {}, env = process.env, { enforceWhenUnspecified = false } = {}) {
+function imageAllowedRootPolicy(ctx = {}, env = process.env) {
   const contextModes = normalizeImagePermissionModes(imagePermissionContextCandidates(ctx));
   const envModes = normalizeImagePermissionModes(imagePermissionEnvCandidates(env));
   const allModes = contextModes.concat(envModes);
@@ -1200,23 +1196,18 @@ function imageAllowedRootPolicy(ctx = {}, env = process.env, { enforceWhenUnspec
   if (contextModes.some((mode) => RESTRICTED_IMAGE_READ_MODES.has(mode))) return true;
   if (envModes.some((mode) => AUTO_IMAGE_READ_MODES.has(mode))) return false;
   if (envModes.some((mode) => RESTRICTED_IMAGE_READ_MODES.has(mode))) return true;
-  return enforceWhenUnspecified;
-}
-
-function imageReadHasFullDiskRead(ctx = {}, env = process.env) {
-  return normalizeImagePermissionModes(imagePermissionModeCandidates(ctx, env))
-    .some((mode) => FULL_DISK_IMAGE_READ_MODES.has(mode));
+  return false;
 }
 
 function imageReadShouldEnforceAllowedRoots(ctx = {}, env = process.env) {
-  return imageAllowedRootPolicy(ctx, env, { enforceWhenUnspecified: false });
+  return imageAllowedRootPolicy(ctx, env);
 }
 
 function imagePreflightShouldEnforceAllowedRoots(event = {}, ctx = {}, env = process.env) {
   return imageAllowedRootPolicy({
     sandboxMode: firstString(event.sandboxMode, event.sandbox_mode, ctx.sandboxMode, ctx.sandbox_mode),
     permissionMode: firstString(event.permissionMode, event.permission_mode, ctx.permissionMode, ctx.permission_mode),
-  }, env, { enforceWhenUnspecified: false });
+  }, env);
 }
 
 function pathHasProtectedSegment(path) {
@@ -2027,6 +2018,13 @@ function parseServerSentEventBlock(block) {
   return { event, data: data.join('\n') };
 }
 
+function nextServerSentEventSeparator(buffer) {
+  const match = String(buffer || '').match(/\r?\n\r?\n/);
+  return match && match.index !== undefined
+    ? { index: match.index, length: match[0].length }
+    : undefined;
+}
+
 function anthropicStreamTextDelta(payload) {
   const delta = payload?.delta;
   if (delta?.type === 'text_delta' && typeof delta.text === 'string') return delta.text;
@@ -2104,9 +2102,9 @@ async function readAnthropicEventStreamResponse(response, providerName, secretVa
       if (done) break;
       buffer += decoder.decode(value, { stream: true });
       let separator;
-      while ((separator = buffer.indexOf('\n\n')) !== -1) {
-        const block = buffer.slice(0, separator);
-        buffer = buffer.slice(separator + 2);
+      while ((separator = nextServerSentEventSeparator(buffer))) {
+        const block = buffer.slice(0, separator.index);
+        buffer = buffer.slice(separator.index + separator.length);
         const event = parseServerSentEventBlock(block);
         if (!event.data) continue;
         if (event.data === '[DONE]') {
@@ -2924,10 +2922,6 @@ function resolveImagePreflightArtifact(handle, ctx = {}, options = {}) {
   return { path: filePath, metadata: undefined };
 }
 
-function resolveImagePreflightArtifactPath(handle, ctx = {}, options = {}) {
-  return resolveImagePreflightArtifact(handle, ctx, options).path;
-}
-
 function executeImagePreflightRead(params = {}, _signal, ctx = {}, options = {}) {
   const normalized = normalizeImagePreflightReadParams(params);
   let text;
@@ -3101,7 +3095,7 @@ function normalizeImageReadPaths(value) {
   return paths;
 }
 
-function normalizeImageReadParams(params = {}, config = resolveVisionPreflightConfig()) {
+function normalizeImageReadParams(params = {}) {
   if (!params || typeof params !== 'object' || Array.isArray(params)) {
     throw new Error('image_read input must be an object');
   }
@@ -3413,7 +3407,7 @@ function imageReadDetails(config, collected, summaryImages = [], failure) {
   };
 }
 
-function imageReadToolText(contextBlock, config, collected, summaryImages = [], failure) {
+function imageReadToolText(contextBlock, collected, summaryImages = [], failure) {
   const analyzed = failure ? summaryImages.length : collected.images.length;
   const skipped = collected.skipped.length > 0 ? `; skipped ${countLabel(collected.skipped.length, 'image')}` : '';
   const status = failure
@@ -3449,7 +3443,7 @@ async function executeImageRead(params = {}, signal, ctx = {}, options = {}) {
   const config = resolveVisionPreflightConfig(options);
   let normalized;
   try {
-    normalized = normalizeImageReadParams(params, config);
+    normalized = normalizeImageReadParams(params);
   } catch (error) {
     return imageReadRejectionResult(
       { ...config, maxImages: 1 },
@@ -3466,10 +3460,6 @@ async function executeImageRead(params = {}, signal, ctx = {}, options = {}) {
 
   const collected = collectImageReadInputs(normalized, ctx, toolConfig, options);
 
-  if (collected.rejection) {
-    return imageReadRejectionResult(toolConfig, collected.rejection, collected);
-  }
-
   if (collected.images.length === 0) {
     const contextBlock = renderVisionContext({
       config: toolConfig,
@@ -3478,7 +3468,7 @@ async function executeImageRead(params = {}, signal, ctx = {}, options = {}) {
       skipped: collected.skipped,
       source: IMAGE_READ_TOOL,
     });
-    return toolResult(imageReadToolText(contextBlock, toolConfig, collected, []), imageReadDetails(toolConfig, collected, []));
+    return toolResult(imageReadToolText(contextBlock, collected, []), imageReadDetails(toolConfig, collected, []));
   }
 
   if (collected.images.length > 1) {
@@ -3511,7 +3501,7 @@ async function executeImageRead(params = {}, signal, ctx = {}, options = {}) {
       skipped: collected.skipped,
       source: IMAGE_READ_TOOL,
     });
-    return toolResult(imageReadToolText(contextBlock, toolConfig, collected, summaryImages), imageReadDetails(toolConfig, collected, summaryImages));
+    return toolResult(imageReadToolText(contextBlock, collected, summaryImages), imageReadDetails(toolConfig, collected, summaryImages));
   } catch (error) {
     const reason = safeImagePreflightFailureReason(error?.message ?? String(error));
     const contextBlock = renderVisionContext({
@@ -3523,7 +3513,7 @@ async function executeImageRead(params = {}, signal, ctx = {}, options = {}) {
       source: IMAGE_READ_TOOL,
     });
     return toolResult(
-      imageReadToolText(contextBlock, toolConfig, collected, [], reason),
+      imageReadToolText(contextBlock, collected, [], reason),
       imageReadDetails(toolConfig, collected, [], reason),
     );
   }

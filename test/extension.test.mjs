@@ -75,7 +75,7 @@ function captureFetchResponse(responseFactory) {
   return fetchFn;
 }
 
-function eventStreamResponse(chunks, status = 200) {
+function eventStreamResponse(chunks, status = 200, { close = true } = {}) {
   const encoder = new TextEncoder();
   return {
     ok: status >= 200 && status < 300,
@@ -86,7 +86,7 @@ function eventStreamResponse(chunks, status = 200) {
     body: new ReadableStream({
       start(controller) {
         for (const chunk of chunks) controller.enqueue(encoder.encode(chunk));
-        controller.close();
+        if (close) controller.close();
       },
     }),
     async text() {
@@ -95,27 +95,8 @@ function eventStreamResponse(chunks, status = 200) {
   };
 }
 
-function stalledEventStreamResponse(chunks, status = 200) {
-  const encoder = new TextEncoder();
-  return {
-    ok: status >= 200 && status < 300,
-    status,
-    headers: {
-      get: (name) => (String(name).toLowerCase() === 'content-type' ? 'text/event-stream;charset=utf-8' : undefined),
-    },
-    body: new ReadableStream({
-      start(controller) {
-        for (const chunk of chunks) controller.enqueue(encoder.encode(chunk));
-      },
-    }),
-    async text() {
-      return chunks.join('');
-    },
-  };
-}
-
-function sseEvent(type, data) {
-  return `event: ${type}\ndata: ${JSON.stringify(data)}\n\n`;
+function sseEvent(type, data, { lineEnding = '\n' } = {}) {
+  return [`event: ${type}`, `data: ${JSON.stringify(data)}`, '', ''].join(lineEnding);
 }
 
 function sleep(ms, signal) {
@@ -5311,7 +5292,7 @@ test('image preflight uses built-in Kimi coding fallback when provider is not in
   assert.equal(payload.messages[0].content[1].source.media_type, 'image/png');
 });
 
-test('image preflight parses streamed built-in Kimi vision responses', async () => {
+test('image preflight parses CRLF-delimited streamed built-in Kimi vision responses', async () => {
   const root = mkdtempSync(join(tmpdir(), 'stronk-pi-image-builtin-kimi-stream.'));
   const stateRoot = join(root, '.stronk-pi');
   mkdirSync(join(stateRoot, 'agent'), { recursive: true });
@@ -5339,13 +5320,14 @@ test('image preflight parses streamed built-in Kimi vision responses', async () 
     ],
   });
   const midpoint = Math.ceil(streamedText.length / 2);
+  const crlf = { lineEnding: '\r\n' };
   const fetchFn = captureFetchResponse(() => eventStreamResponse([
-    sseEvent('message_start', { type: 'message_start' }),
-    sseEvent('content_block_start', { type: 'content_block_start', index: 0, content_block: { type: 'text', text: '' } }),
-    sseEvent('content_block_delta', { type: 'content_block_delta', index: 0, delta: { type: 'text_delta', text: streamedText.slice(0, midpoint) } }),
-    sseEvent('content_block_delta', { type: 'content_block_delta', index: 0, delta: { type: 'text_delta', text: streamedText.slice(midpoint) } }),
-    sseEvent('content_block_stop', { type: 'content_block_stop', index: 0 }),
-    sseEvent('message_stop', { type: 'message_stop' }),
+    sseEvent('message_start', { type: 'message_start' }, crlf),
+    sseEvent('content_block_start', { type: 'content_block_start', index: 0, content_block: { type: 'text', text: '' } }, crlf),
+    sseEvent('content_block_delta', { type: 'content_block_delta', index: 0, delta: { type: 'text_delta', text: streamedText.slice(0, midpoint) } }, crlf),
+    sseEvent('content_block_delta', { type: 'content_block_delta', index: 0, delta: { type: 'text_delta', text: streamedText.slice(midpoint) } }, crlf),
+    sseEvent('content_block_stop', { type: 'content_block_stop', index: 0 }, crlf),
+    sseEvent('message_stop', { type: 'message_stop' }, crlf),
   ]));
 
   const result = await withEnv(allowingPromptHookEnv({
@@ -5391,10 +5373,10 @@ test('image preflight idle-times out stalled Kimi streams without token progress
     'model = "kimi-coding/kimi-for-coding:xhigh"',
     '',
   ].join('\n'));
-  const fetchFn = captureFetchResponse(() => stalledEventStreamResponse([
+  const fetchFn = captureFetchResponse(() => eventStreamResponse([
     sseEvent('message_start', { type: 'message_start' }),
     sseEvent('content_block_start', { type: 'content_block_start', index: 0, content_block: { type: 'text', text: '' } }),
-  ]));
+  ], 200, { close: false }));
 
   const result = await withEnv(allowingPromptHookEnv({
     STRONK_PI_STATE_ROOT: stateRoot,
