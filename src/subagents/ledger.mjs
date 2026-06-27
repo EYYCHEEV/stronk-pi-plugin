@@ -1,11 +1,26 @@
 import { randomUUID, createHash } from 'node:crypto';
-import { appendFile, mkdir, readFile, rename, writeFile, chmod } from 'node:fs/promises';
+import { appendFile, mkdir, readFile, rename, rm, writeFile, chmod } from 'node:fs/promises';
 import { homedir } from 'node:os';
 import { dirname, resolve, join } from 'node:path';
 
 const SCHEMA_VERSION = 1;
 const TERMINAL_STATUSES = new Set(['completed', 'failed', 'closed', 'interrupted', 'stale', 'dry-run']);
+const OUTPUT_ARTIFACT_CAP_BYTES = 1024 * 1024;
 const pathLocks = new Map();
+const SECRET_VALUE_PATTERNS = [
+  /sk-[A-Za-z0-9_-]{16,}/g,
+  /gh[pousr]_[A-Za-z0-9_]{16,}/g,
+  /AKIA[0-9A-Z]{16}/g,
+  /xox[baprs]-[A-Za-z0-9-]{16,}/g,
+  /\bBearer\s+[A-Za-z0-9._~+/=-]{16,}/g,
+  /-----BEGIN [A-Z ]*PRIVATE KEY-----[\s\S]*?-----END [A-Z ]*PRIVATE KEY-----/g,
+];
+const SECRET_ASSIGNMENT_PATTERN = /(\b(?:key|password|token|secret|[A-Za-z_][A-Za-z0-9_-]*(?:key|password|token|secret)[A-Za-z0-9_-]*)\b\s*[:=]\s*)(?:"[^"]*"|'[^']*'|[^\s,;}]+)/gi;
+const QUOTED_FILE_URL_PATTERN = /(["'])(file:\/\/\/[^"'`\n]+)\1/g;
+const FILE_URL_PATTERN = /file:\/\/\/[^\s"'`\n),;}>]*/g;
+const QUOTED_LOCAL_PATH_PATTERN = /(["'])((?:\/Users|\/home|\/tmp|\/private\/tmp|\/var\/folders|\/private\/var|\/root|\/etc)\/[^"'`\n]*)\1/g;
+const LOCAL_PATH_PATTERN = /(^|[\s([{<])((?:\/Users|\/home|\/tmp|\/private\/tmp|\/var\/folders|\/private\/var|\/root|\/etc)(?:\/[^\s"'`\n),;}>]*)?)/g;
+const SSH_PATH_PATTERN = /(^|[\s([{<])([^\s"'`\n),;}>]*\.ssh[^\s"'`\n),;}>]*)/g;
 
 function sha256(text) {
   return createHash('sha256').update(String(text)).digest('hex');
@@ -13,6 +28,56 @@ function sha256(text) {
 
 function bytes(text) {
   return Buffer.byteLength(String(text), 'utf8');
+}
+
+function escapeRegExp(value) {
+  return String(value).replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+}
+
+export function sanitizePublicOutput(text, extraPaths = []) {
+  let value = String(text ?? '');
+  for (const pattern of SECRET_VALUE_PATTERNS) {
+    value = value.replace(pattern, '<redacted>');
+  }
+  value = value.replace(SECRET_ASSIGNMENT_PATTERN, '$1<redacted>');
+  for (const rawPath of [stateRoot(), ...extraPaths]) {
+    if (!rawPath) continue;
+    value = value.replace(new RegExp(escapeRegExp(resolve(String(rawPath))), 'g'), '<redacted-path>');
+  }
+  value = value.replace(QUOTED_FILE_URL_PATTERN, '$1<redacted-path>$1');
+  value = value.replace(FILE_URL_PATTERN, '<redacted-path>');
+  value = value.replace(QUOTED_LOCAL_PATH_PATTERN, '$1<redacted-path>$1');
+  value = value.replace(LOCAL_PATH_PATTERN, '$1<redacted-path>');
+  value = value.replace(SSH_PATH_PATTERN, '$1<redacted-path>');
+  return value;
+}
+
+export function boundedUtf8(text, maxBytes, marker = '') {
+  const value = String(text ?? '');
+  if (bytes(value) <= maxBytes) return { text: value, bytes: bytes(value), chars: [...value].length, truncated: false };
+  const markerBytes = bytes(marker);
+  const contentBudget = Math.max(0, maxBytes - markerBytes);
+  let used = 0;
+  let output = '';
+  for (const char of value) {
+    const charBytes = bytes(char);
+    if (used + charBytes > contentBudget) break;
+    output += char;
+    used += charBytes;
+  }
+  const textOut = `${output}${marker}`;
+  return { text: textOut, bytes: bytes(textOut), chars: [...textOut].length, truncated: true };
+}
+
+function recommendedNextAction(child) {
+  if (child.recommendedNextAction) return child.recommendedNextAction;
+  if (child.status === 'running' || child.status === 'spawned') return 'wait_again';
+  if (child.status === 'completed') return 'close_child';
+  if (child.failureClass === 'provider_capacity' || child.retryReason === 'provider_capacity') return 'retry_capacity_children_next_batch';
+  if (child.status === 'failed') return 'inspect_error';
+  if (child.status === 'stale') return 'run_diagnose';
+  if (child.status === 'interrupted') return 'inspect_error';
+  return null;
 }
 
 function nowIso() {
@@ -91,17 +156,53 @@ async function withPathLock(path, action) {
 function publicChild(child) {
   return {
     childId: child.childId,
+    projectRef: child.projectRef ?? null,
     role: child.role,
-    cwd: child.cwd,
+    roleRequested: child.roleRequested ?? child.role,
+    roleUsed: child.roleUsed ?? child.role,
+    aliasResolved: Boolean(child.aliasResolved),
+    aliasMessage: child.aliasMessage ?? null,
     status: child.status,
+    isTerminal: isTerminalStatus(child.status),
     previousChildId: child.previousChildId ?? null,
     upstreamRunId: child.upstreamRunId ?? null,
+    upstreamState: child.upstreamState ?? null,
     intercomTarget: child.intercomTarget ?? null,
     pid: child.pid ?? null,
     terminalResult: child.terminalResult ?? null,
+    terminalOutputPreview: child.terminalOutputPreview ?? child.childOutputPreview ?? null,
     terminalResultSha256: child.terminalResultSha256 ?? null,
     terminalResultBytes: child.terminalResultBytes ?? null,
+    childOutputPreview: child.childOutputPreview ?? null,
+    childOutputTruncated: Boolean(child.childOutputTruncated),
+    childOutputBytes: child.childOutputBytes ?? 0,
+    childOutputHash: child.childOutputHash ?? null,
+    childOutputHandle: child.childOutputHandle ?? null,
+    childOutputFullBytes: child.childOutputFullBytes ?? null,
+    childOutputFullChars: child.childOutputFullChars ?? null,
+    childOutputFullHash: child.childOutputFullHash ?? null,
+    childOutputArtifactTruncated: Boolean(child.childOutputArtifactTruncated),
+    failureReason: child.failureReason ?? null,
+    failureClass: child.failureClass ?? null,
+    retryable: Boolean(child.retryable),
+    retryReason: child.retryReason ?? null,
+    retryAfterMs: typeof child.retryAfterMs === 'number' ? child.retryAfterMs : null,
+    capacityBlocked: Boolean(child.capacityBlocked),
+    concurrencyInUse: typeof child.concurrencyInUse === 'number' ? child.concurrencyInUse : null,
+    concurrencyLimit: typeof child.concurrencyLimit === 'number' ? child.concurrencyLimit : null,
+    outputUsableForSynthesis: child.outputUsableForSynthesis ?? Boolean(child.childOutputPreview || child.childOutputHandle),
+    errorSummary: child.errorSummary ?? null,
+    closeError: child.closeError ? sanitizePublicOutput(child.closeError, [child.cwd]) : null,
+    timedOut: Boolean(child.timedOut),
+    elapsedMs: typeof child.elapsedMs === 'number' ? child.elapsedMs : null,
+    timeoutMs: typeof child.timeoutMs === 'number' ? child.timeoutMs : null,
+    recommendedNextAction: recommendedNextAction(child),
+    closeRequested: Boolean(child.closeRequested),
     cleanupState: child.cleanupState ?? 'none',
+    processLive: child.processLive ?? null,
+    cleanupVerified: Boolean(child.cleanupVerified),
+    inputAccepted: Boolean(child.inputAccepted),
+    inputLinkedChildId: child.inputLinkedChildId ?? null,
     createdAt: child.createdAt,
     updatedAt: child.updatedAt,
   };
@@ -109,6 +210,20 @@ function publicChild(child) {
 
 export function isTerminalStatus(status) {
   return TERMINAL_STATUSES.has(status);
+}
+
+function containedOutputPath(outputDir, artifactPath) {
+  if (!artifactPath) return null;
+  const outputRoot = resolve(outputDir);
+  const target = resolve(String(artifactPath));
+  return target.startsWith(`${outputRoot}/`) ? target : null;
+}
+
+async function removeContainedOutput(outputDir, artifactPath) {
+  const target = containedOutputPath(outputDir, artifactPath);
+  if (!target) return false;
+  await rm(target, { force: true });
+  return true;
 }
 
 export class SubagentLedger {
@@ -120,6 +235,7 @@ export class SubagentLedger {
     this.manifestPath = join(this.dir, 'manifest.json');
     this.childrenPath = join(this.dir, 'children.json');
     this.eventsPath = join(this.dir, 'events.ndjson');
+    this.outputDir = join(this.dir, 'outputs');
     this.mode = mode;
     this.maxChildren = maxChildren;
   }
@@ -172,15 +288,30 @@ export class SubagentLedger {
     });
   }
 
-  async createChild({ role, cwd = this.cwd, task, previousChildId = null }) {
+  async createChild({
+    role,
+    cwd = this.cwd,
+    task,
+    previousChildId = null,
+    roleRequested = role,
+    roleUsed = role,
+    aliasResolved = false,
+    aliasMessage = null,
+  }) {
     const at = nowIso();
     const child = await this.mutateChildren((children) => {
-      if (children.length >= this.maxChildren) {
-        throw new Error(`stronk_subagent child limit exceeded: ${children.length}>${this.maxChildren - 1}`);
+      const activeChildren = children.filter((item) => !isTerminalStatus(item.status));
+      if (activeChildren.length >= this.maxChildren) {
+        throw new Error(`stronk_subagent child limit exceeded: ${activeChildren.length}>${this.maxChildren - 1}`);
       }
       const nextChild = {
         childId: `sp-child-${randomUUID()}`,
+        projectRef: this.projectHash,
         role,
+        roleRequested,
+        roleUsed,
+        aliasResolved: Boolean(aliasResolved),
+        aliasMessage,
         cwd: resolve(cwd || this.cwd),
         status: 'spawned',
         previousChildId,
@@ -197,7 +328,37 @@ export class SubagentLedger {
         terminalResult: null,
         terminalResultSha256: null,
         terminalResultBytes: 0,
+        terminalOutputPreview: null,
+        childOutputPreview: null,
+        childOutputTruncated: false,
+        childOutputBytes: 0,
+        childOutputHash: null,
+        childOutputHandle: null,
+        childOutputArtifactPath: null,
+        childOutputFullBytes: null,
+        childOutputFullChars: null,
+        childOutputFullHash: null,
+        childOutputArtifactTruncated: false,
+        failureReason: null,
+        failureClass: null,
+        retryable: false,
+        retryReason: null,
+        retryAfterMs: null,
+        capacityBlocked: false,
+        concurrencyInUse: null,
+        concurrencyLimit: null,
+        outputUsableForSynthesis: null,
+        errorSummary: null,
+        timedOut: false,
+        elapsedMs: null,
+        timeoutMs: null,
+        recommendedNextAction: 'wait_again',
+        closeRequested: false,
         cleanupState: 'none',
+        processLive: null,
+        cleanupVerified: false,
+        inputAccepted: false,
+        inputLinkedChildId: null,
         taskSha256: sha256(task),
         taskBytes: bytes(task),
         createdAt: at,
@@ -250,6 +411,85 @@ export class SubagentLedger {
       manifest: this.manifestPath,
       children: this.childrenPath,
       events: this.eventsPath,
+    };
+  }
+
+  outputPathForHandle(handle) {
+    return join(this.outputDir, `${handle}.txt`);
+  }
+
+  async storeChildOutput(childId, rawText) {
+    const child = await this.getChild(childId);
+    if (child.childOutputArtifactPath) {
+      await removeContainedOutput(this.outputDir, child.childOutputArtifactPath).catch(() => {});
+    }
+    const sanitized = sanitizePublicOutput(rawText, [this.cwd, this.dir]);
+    const capped = boundedUtf8(sanitized, OUTPUT_ARTIFACT_CAP_BYTES);
+    const handle = `subagent-output-${randomUUID()}`;
+    const artifactPath = this.outputPathForHandle(handle);
+    await writePrivateFile(artifactPath, capped.text);
+    return this.updateChild(childId, {
+      childOutputHandle: handle,
+      childOutputArtifactPath: artifactPath,
+      childOutputFullBytes: capped.bytes,
+      childOutputFullChars: capped.chars,
+      childOutputFullHash: sha256(capped.text),
+      childOutputArtifactTruncated: capped.truncated,
+    }, 'child_output_stored');
+  }
+
+  async clearChildOutput(childId) {
+    const child = await this.getChild(childId);
+    if (child.childOutputArtifactPath) {
+      await removeContainedOutput(this.outputDir, child.childOutputArtifactPath).catch(() => {});
+    }
+    return this.updateChild(childId, {
+      childOutputHandle: null,
+      childOutputArtifactPath: null,
+      childOutputFullBytes: null,
+      childOutputFullChars: null,
+      childOutputFullHash: null,
+      childOutputArtifactTruncated: false,
+    }, 'child_output_removed');
+  }
+
+  async readOutput(handle, { offset = 0, maxChars = 12000 } = {}) {
+    const children = await this.children();
+    const child = children.find((item) => item.childOutputHandle === handle);
+    if (!child || !child.childOutputArtifactPath) {
+      throw new Error('stronk_subagent output handle denied');
+    }
+    const artifactPath = containedOutputPath(this.outputDir, child.childOutputArtifactPath);
+    if (!artifactPath) {
+      throw new Error('stronk_subagent output handle denied');
+    }
+    const text = await readFile(artifactPath, 'utf8');
+    const chars = [...text];
+    if (offset > chars.length) {
+      throw new Error('offset exceeds output length');
+    }
+    const chunk = chars.slice(offset, offset + maxChars).join('');
+    const nextOffset = offset + [...chunk].length;
+    return {
+      handle,
+      chunk,
+      offset,
+      nextOffset,
+      totalChars: chars.length,
+      eof: nextOffset >= chars.length,
+      artifactTruncated: Boolean(child.childOutputArtifactTruncated),
+      redacted: true,
+      bytes: bytes(text),
+      hash: sha256(text),
+    };
+  }
+
+  publicDiagnostics() {
+    return {
+      facadeRunId: this.runId,
+      projectRef: this.projectHash,
+      mode: this.mode,
+      maxChildren: this.maxChildren,
     };
   }
 }

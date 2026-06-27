@@ -22,7 +22,7 @@ const SESSION_TOOLS = new Set(['todowrite', 'todoread', 'question', 'ask_user'])
 const INTERCOM_TOOLS = new Set(['intercom', 'contact_supervisor']);
 const READ_ONLY_TOOLS = new Set(['read', 'grep', 'find', 'ls', 'glob', 'todoread']);
 const MUTATING_TOOLS = new Set(['bash', 'write', 'edit', 'patch', 'apply_patch', 'multi_edit']);
-const PLUGIN_TOOLS = new Set(['mcp', 'subagent', STRONK_SUBAGENT_TOOL, ...WEB_TOOLS, ...IMAGE_TOOLS, ...SESSION_TOOLS, ...INTERCOM_TOOLS]);
+const PLUGIN_TOOLS = new Set(['mcp', STRONK_SUBAGENT_TOOL, ...WEB_TOOLS, ...IMAGE_TOOLS, ...SESSION_TOOLS, ...INTERCOM_TOOLS]);
 const SEARCH_PROVIDERS = ['exa', 'brave', 'tavily', 'gemini'];
 const SEARCH_WORKFLOWS = ['auto', 'summary-review', 'none'];
 const SEARCH_WORKFLOW_SET = new Set(SEARCH_WORKFLOWS);
@@ -3453,6 +3453,19 @@ async function executeImageRead(params = {}, signal, ctx = {}, options = {}) {
     );
   }
   const toolConfig = { ...config, maxImages: 1 };
+
+  if (modelSupportsImageInput({}, ctx, options)) {
+    const modelRef = activeModelRef({}, ctx) || 'current model';
+    return imageReadRejectionResult(
+      toolConfig,
+      {
+        reason: 'native multimodal model',
+        message: `image_read is only for text-only models. ${modelRef} supports native image input; use normal image handling instead.`,
+        mode: 'model',
+      },
+      { images: [], skipped: [] },
+    );
+  }
 
   if (!toolConfig.enabled) {
     const text = 'Image Read unavailable: image_preflight is disabled.';
@@ -8038,13 +8051,40 @@ function formatFetchRenderResult(result = {}) {
   return lines.join('\n');
 }
 
+class UnavailableSubagentAdapter {
+  constructor(reason) {
+    this.reason = reason;
+  }
+
+  unavailable() {
+    throw new Error(`stronk_subagent intercom adapter unavailable: ${this.reason}`);
+  }
+
+  async spawn() { this.unavailable(); }
+  async wait() { this.unavailable(); }
+  async status() { this.unavailable(); }
+  async sendInput() { this.unavailable(); }
+  async close() { this.unavailable(); }
+  async interrupt() { this.unavailable(); }
+  async revive() { this.unavailable(); }
+}
+
+function subagentAdapterForPi(pi) {
+  if (facadeAdapterMode() !== 'intercom') return undefined;
+  if (!pi.events) {
+    return new UnavailableSubagentAdapter('pi.events is required; ensure pi-subagents and pi-intercom are loaded before the Stronk facade');
+  }
+  return new PiSubagentsBridgeAdapter({ events: pi.events });
+}
+
 function registerStronkTools(pi, state = { todos: [] }) {
   if (typeof pi.registerTool !== 'function') return;
   if (facadeEnabled()) {
-    const adapter = facadeAdapterMode() === 'intercom'
-      ? new PiSubagentsBridgeAdapter({ events: pi.events })
-      : undefined;
-    const executeFacade = createSubagentFacade(adapter ? { adapter } : {});
+    const adapter = subagentAdapterForPi(pi);
+    const executeFacade = createSubagentFacade({
+      ...(adapter ? { adapter } : {}),
+      parentModelProvider: (execution) => activeModelRef({}, execution?.ctx || {}),
+    });
     pi.registerTool({
       name: STRONK_SUBAGENT_TOOL,
       label: STRONK_SUBAGENT_TOOL,
@@ -8052,12 +8092,22 @@ function registerStronkTools(pi, state = { todos: [] }) {
       promptSnippet: 'Run a guarded Stronk Pi subagent action',
       promptGuidelines: [
         'Use stronk_subagent for Stronk-owned subagent lifecycle actions.',
-        'Raw upstream subagent management fields, model/tool overrides, worktrees, chains, and output-path hints are denied.',
+        'Spawned children use fresh context; skills are passed through prompt-time context, not user-supplied override fields.',
+        'Raw upstream subagent calls, model/tool/skill overrides, worktrees, chains, and output-path hints are denied.',
+        'Public results are path-clean: do not expect cwd, upstream temp paths, durable output paths, ledger paths, or debug artifact paths.',
+        'Use wait_all for explicit current-run child IDs when coordinating batches; duplicate, invalid, unknown, or foreign child IDs are denied.',
+        'Provider capacity failures expose failureClass=provider_capacity, retryable=true, and retryableCapacityChildIds; treat them as retry lifecycle state, not child findings.',
+        'For provider capacity failures, wait for nextRetryAfterMs or for non-terminal batch children to drain, then retry with guarded revive; do not switch models or add fallback/provider/concurrency overrides.',
+        'Use read_output with opaque childOutputHandle values for bounded sanitized chunks; handles are invalidated by close and close_all.',
+        'Use close_all for explicit batch cleanup and inspect per-child close and cleanup failure arrays.',
+        'Use long waits, respect terminal barriers before synthesis, send follow-up only to non-terminal children, and close children after terminal synthesis.',
+        'Check roleRequested, roleUsed, aliasResolved, timedOut, recommendedNextAction, failedChildIds, cleanupFailedChildIds, and cleanupVerified before reporting lifecycle status.',
+        'Recheck file-line citations from current files during synthesis instead of trusting stale child citations.',
       ],
       parameters: stronkSubagentSchema,
       execute: async (...args) => {
-        const { params } = normalizeToolArgs(args);
-        const result = await executeFacade(params);
+        const { params, ctx } = normalizeToolArgs(args);
+        const result = await executeFacade(params, { ctx });
         return toolResult(result.text, result.details);
       },
     });
@@ -8087,7 +8137,7 @@ function registerStronkTools(pi, state = { todos: [] }) {
       'Use image_read when a text-only model discovers local image files after the prompt starts.',
       'Call image_read once per image; pass one exact path when possible.',
       'Use directory only when one bounded folder scan is expected to resolve exactly one image.',
-      'Do not use image_read for native multimodal models unless explicit text-only image evidence is needed.',
+      'Never use image_read for native multimodal models; use normal image handling instead.',
     ],
     parameters: imageReadSchema,
     execute: async (...args) => {
@@ -8207,6 +8257,7 @@ function isUnsupportedMutatingTool(toolName) {
 async function handleToolCall(event, ctx = {}) {
   const toolName = event?.toolName;
   if (!toolName) return block('tool_call missing toolName');
+  if (toolName === 'subagent') return block('raw subagent tool denied; use stronk_subagent');
   if (isUnsupportedMutatingTool(toolName)) return block(`unsupported mutating tool denied: ${toolName}`);
   if (DISABLED_PLUGIN_TOOLS.has(toolName)) return block(`disabled upstream tool denied: ${toolName}; use ${SAFE_FETCH_TOOL}`);
   if (hasBlockingSensitiveContent(event.input ?? {})) return block('secret literal blocked in tool_call input');
@@ -8319,6 +8370,7 @@ function hasReadableSessionFile(sessionFile) {
 
 function buildSessionResumeHint(event = {}, ctx = {}) {
   if (event?.reason !== 'quit') return undefined;
+  if (event?.suppressSessionResumeHint === true) return undefined;
   if (!shouldShowSessionResumeHint(ctx)) return undefined;
 
   const sessionId = sessionManagerString(ctx, 'getSessionId');
@@ -8327,7 +8379,7 @@ function buildSessionResumeHint(event = {}, ctx = {}) {
   const sessionFile = sessionManagerString(ctx, 'getSessionFile');
   if (!hasReadableSessionFile(sessionFile)) return undefined;
 
-  return `To continue this session, run pi --session ${sessionId}`;
+  return `To continue this session, run stronkpi --session ${sessionId}`;
 }
 
 function writeSessionResumeHint(message) {

@@ -2,6 +2,7 @@ import { mkdtempSync, writeFileSync, chmodSync, readFileSync, existsSync, mkdirS
 import { createServer } from 'node:http';
 import { join } from 'node:path';
 import { tmpdir } from 'node:os';
+import { EventEmitter } from 'node:events';
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import stronkPi, { internals } from '../src/index.mjs';
@@ -73,6 +74,21 @@ function captureFetchResponse(responseFactory) {
   };
   fetchFn.calls = calls;
   return fetchFn;
+}
+
+class FakePiEvents {
+  constructor() {
+    this.emitter = new EventEmitter();
+  }
+
+  on(event, handler) {
+    this.emitter.on(event, handler);
+    return () => this.emitter.off(event, handler);
+  }
+
+  emit(event, data) {
+    this.emitter.emit(event, data);
+  }
 }
 
 function eventStreamResponse(chunks, status = 200, { close = true } = {}) {
@@ -395,7 +411,7 @@ test('registers Pi hook handlers', async () => {
   assert.equal(typeof handlers.get('permission_request'), 'function');
 });
 
-test('session_shutdown prints exact pi --session resume hint for persisted quit sessions', () => {
+test('session_shutdown prints exact stronkpi --session resume hint for persisted quit sessions', () => {
   const dir = mkdtempSync(join(tmpdir(), 'stronk-pi-session-hint.'));
   const sessionFile = join(dir, '2026-05-06T00-00-00-000Z_019df935-0a98-76e2-8c4c-bdc177d06994.jsonl');
   writeFileSync(sessionFile, '{"type":"session"}\n');
@@ -413,7 +429,9 @@ test('session_shutdown prints exact pi --session resume hint for persisted quit 
     (message) => lines.push(message),
   );
 
-  assert.equal(hint, 'To continue this session, run pi --session 019df935-0a98-76e2-8c4c-bdc177d06994');
+  assert.equal(hint, 'To continue this session, run stronkpi --session 019df935-0a98-76e2-8c4c-bdc177d06994');
+  assert.doesNotMatch(hint, /(^|\s)pi\s+--session\b/);
+  assert.doesNotMatch(hint, /(^|\s)--session-dir(?:\s|=)/);
   assert.deepEqual(lines, [hint]);
 });
 
@@ -450,7 +468,9 @@ test('session_shutdown default writer keeps stdout clean', () => {
   }
 
   assert.equal(stdout, '');
-  assert.equal(stderr, 'To continue this session, run pi --session 019df935-0a98-76e2-8c4c-bdc177d06994\n');
+  assert.equal(stderr, 'To continue this session, run stronkpi --session 019df935-0a98-76e2-8c4c-bdc177d06994\n');
+  assert.doesNotMatch(stderr, /(^|\s)pi\s+--session\b/);
+  assert.doesNotMatch(stderr, /(^|\s)--session-dir(?:\s|=)/);
 });
 
 test('session_shutdown still prints after Pi has stopped the interactive UI', async () => {
@@ -473,7 +493,9 @@ test('session_shutdown still prints after Pi has stopped the interactive UI', as
     (message) => lines.push(message),
   );
 
-  assert.equal(hint, 'To continue this session, run pi --session 019df935-0a98-76e2-8c4c-bdc177d06994');
+  assert.equal(hint, 'To continue this session, run stronkpi --session 019df935-0a98-76e2-8c4c-bdc177d06994');
+  assert.doesNotMatch(hint, /(^|\s)pi\s+--session\b/);
+  assert.doesNotMatch(hint, /(^|\s)--session-dir(?:\s|=)/);
   assert.deepEqual(lines, [hint]);
 });
 
@@ -485,6 +507,18 @@ test('session_shutdown suppresses resume hint when exact resume would be unsafe 
     getSessionId: () => '019df935-0a98-76e2-8c4c-bdc177d06994',
     getSessionFile: () => sessionFile,
   };
+
+  const hostOwnedLines = [];
+  assert.equal(
+    internals.handleSessionShutdown(
+      { type: 'session_shutdown', reason: 'quit', suppressSessionResumeHint: true },
+      { hasUI: true, sessionManager },
+      (message) => hostOwnedLines.push(message),
+    ),
+    undefined,
+    'host-owned resume hint',
+  );
+  assert.deepEqual(hostOwnedLines, []);
 
   for (const reason of ['reload', 'new', 'resume', 'fork']) {
     const lines = [];
@@ -564,6 +598,7 @@ test('registers Stronk Pi custom tools', async () => {
   assert.equal(byName.get('image_read').parameters.properties.directory.type, 'string');
   assert.equal(Object.hasOwn(byName.get('image_read').parameters.properties, 'max_images'), false);
   assert.match(byName.get('image_read').promptGuidelines.join('\n'), /once per image/);
+  assert.match(byName.get('image_read').promptGuidelines.join('\n'), /Never use image_read for native multimodal models/);
   assert.deepEqual(byName.get('web_search').parameters.properties.workflow.enum, ['auto', 'summary-review', 'none']);
   assert.deepEqual(byName.get('code_search').parameters.properties.workflow.enum, ['auto', 'summary-review', 'none']);
   assert.deepEqual(byName.get('web_search').parameters.properties.curatorAction.enum, ['keep', 'dismiss', 'fetch', 'fetch-kept', 'follow-up', 'finish', 'status']);
@@ -2247,6 +2282,84 @@ test('registers Stronk subagent facade only when enabled by launcher env', async
   assert.ok(tools.some((tool) => tool.name === 'stronk_subagent'));
 });
 
+test('intercom subagent facade reports unavailable adapter when pi events are absent', async () => {
+  const stateRoot = mkdtempSync(join(tmpdir(), 'stronk-pi-subagent-no-events.'));
+  const rolesDir = join(stateRoot, 'roles');
+  mkdirSync(rolesDir);
+  writeFileSync(join(rolesDir, 'executor.toml'), 'name = "executor"\n');
+  const manifestPath = join(stateRoot, 'roles.toml');
+  writeFileSync(manifestPath, `codex_roles_dir = "${rolesDir}"\n`);
+  const tools = [];
+
+  await withEnv({
+    STRONK_PI_STATE_ROOT: stateRoot,
+    STRONK_PI_ROLE_MANIFEST: manifestPath,
+    STRONK_PI_SUBAGENT_FACADE: 'stronk',
+    STRONK_PI_SUBAGENT_ADAPTER: 'intercom',
+  }, async () => {
+    await stronkPi({
+      on: () => {},
+      registerTool: (tool) => tools.push(tool),
+    });
+    const facade = tools.find((tool) => tool.name === 'stronk_subagent');
+
+    await assert.rejects(
+      () => facade.execute({ action: 'spawn', role: 'executor', task: 'should fail before worker spawn' }),
+      /intercom adapter unavailable: pi.events is required/,
+    );
+  });
+});
+
+test('registered intercom subagent facade forwards active model context to child spawn', async () => {
+  const stateRoot = mkdtempSync(join(tmpdir(), 'stronk-pi-subagent-model-context.'));
+  const rolesDir = join(stateRoot, 'roles');
+  mkdirSync(rolesDir);
+  writeFileSync(join(rolesDir, 'executor.toml'), 'name = "executor"\n');
+  const manifestPath = join(stateRoot, 'roles.toml');
+  writeFileSync(manifestPath, `codex_roles_dir = "${rolesDir}"\n`);
+  const tools = [];
+  const events = new FakePiEvents();
+  const capturedRequests = [];
+
+  events.on('subagent:slash:request', (request) => {
+    capturedRequests.push(request);
+    events.emit('subagent:slash:started', { requestId: request.requestId });
+    events.emit('subagent:slash:response', {
+      requestId: request.requestId,
+      isError: false,
+      result: {
+        content: [{ type: 'text', text: 'subagent completed' }],
+        details: { mode: 'single', results: [] },
+      },
+    });
+  });
+
+  await withEnv({
+    STRONK_PI_STATE_ROOT: stateRoot,
+    STRONK_PI_ROLE_MANIFEST: manifestPath,
+    STRONK_PI_SUBAGENT_FACADE: 'stronk',
+    STRONK_PI_SUBAGENT_ADAPTER: 'intercom',
+  }, async () => {
+    await stronkPi({
+      events,
+      on: () => {},
+      registerTool: (tool) => tools.push(tool),
+    });
+    const facade = tools.find((tool) => tool.name === 'stronk_subagent');
+
+    await facade.execute(
+      'tool-call-1',
+      { action: 'spawn', role: 'executor', task: 'inherit parent model' },
+      undefined,
+      undefined,
+      { model: { provider: 'deepseek', id: 'deepseek-v4-pro:high' } },
+    );
+
+    assert.equal(capturedRequests.length, 1);
+    assert.equal(capturedRequests[0].params.model, 'deepseek/deepseek-v4-pro:high');
+  });
+});
+
 test('Stronk-owned fetch_content keeps the guarded registration on duplicate attempts', async () => {
   const tools = new Map();
   const pi = {
@@ -2829,6 +2942,41 @@ test('image_read analyzes explicit local image paths through the configured visi
   assert.equal(JSON.stringify(result.details).includes(PNG_BASE64.slice(0, 24)), false);
   assert.equal(result.details.tool, 'image_read');
   assert.equal(result.details.imageCount, 1);
+});
+
+test('image_read rejects native multimodal model contexts before vision routing', async () => {
+  const root = mkdtempSync(join(tmpdir(), 'stronk-pi-image-read-native.'));
+  const imagePath = writePng(root, 'native.png');
+  const calls = [];
+  const modelsJson = JSON.stringify({
+    providers: {
+      native: {
+        models: [{ id: 'vision-native', input: ['text', 'image'] }],
+      },
+    },
+  });
+
+  const result = await internals.executeImageRead(
+    { paths: [imagePath], question: 'describe it' },
+    undefined,
+    {
+      model: 'native/vision-native',
+      visionPreflight: async (request) => {
+        calls.push(request);
+        return { images: [] };
+      },
+    },
+    {
+      defaultsToml: '[image_preflight]\nmodel = "vision-provider/vision-large"\n',
+      modelsJson,
+    },
+  );
+
+  assert.equal(calls.length, 0);
+  assert.equal(result.details.rejected, true);
+  assert.equal(result.details.failure, 'native multimodal model');
+  assert.match(result.content[0].text, /image_read is only for text-only models/);
+  assert.match(result.content[0].text, /use normal image handling instead/);
 });
 
 test('image_read scans one directory when it resolves exactly one image and does not recurse by default', async () => {
@@ -6607,8 +6755,8 @@ process.stdin.on('end', () => {
 `);
   await withEnv({ STRONK_PI_HOOK_COMMAND_JSON: JSON.stringify([script]) }, async () => {
     const result = await internals.handleToolCall({
-      toolName: 'subagent',
-      input: { agent: 'worker', task: 'edit files' },
+      toolName: 'bash',
+      input: { command: 'printf ok' },
       cwd: process.cwd(),
     });
     assert.equal(result.block, true);
@@ -6696,7 +6844,7 @@ test('managed plugin tools are allowed after helper approval', async () => {
   await withEnv({ STRONK_PI_HOOK_COMMAND_JSON: JSON.stringify([allowScript()]) }, async () => {
     const cases = [
       ['mcp', { search: 'docs' }],
-      ['subagent', { action: 'list' }],
+      ['stronk_subagent', { action: 'status', childId: 'sp-child-example' }],
       ['web_search', { query: 'Pi Coding Agent docs' }],
       ['code_search', { query: 'Pi Coding Agent tool implementation' }],
       ['fetch_content', { url: 'https://example.com' }],
@@ -6710,6 +6858,25 @@ test('managed plugin tools are allowed after helper approval', async () => {
       const result = await internals.handleToolCall({ toolName, input, cwd: process.cwd() });
       assert.equal(result, undefined, `${toolName} should be allowed`);
     }
+  });
+});
+
+test('raw upstream subagent tool is denied while guarded stronk_subagent remains allowlisted', async () => {
+  await withEnv({ STRONK_PI_HOOK_COMMAND_JSON: JSON.stringify([allowScript()]) }, async () => {
+    const raw = await internals.handleToolCall({
+      toolName: 'subagent',
+      input: { action: 'spawn', agent: 'executor', task: 'bypass facade' },
+      cwd: process.cwd(),
+    });
+    assert.equal(raw.block, true);
+    assert.match(raw.reason, /raw subagent tool denied|unknown tool denied/);
+
+    const guarded = await internals.handleToolCall({
+      toolName: 'stronk_subagent',
+      input: { action: 'status', childId: 'sp-child-example' },
+      cwd: process.cwd(),
+    });
+    assert.equal(guarded, undefined);
   });
 });
 
