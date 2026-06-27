@@ -1,4 +1,4 @@
-const ACTIONS = new Set(['spawn', 'wait', 'status', 'send_input', 'interrupt', 'close', 'revive']);
+const ACTIONS = new Set(['spawn', 'wait', 'wait_all', 'read_output', 'status', 'send_input', 'interrupt', 'close', 'close_all', 'revive']);
 const TERMINAL_ACTIONS = new Set(['wait', 'status', 'send_input', 'interrupt', 'close', 'revive']);
 export const MAX_CHILDREN = 6;
 
@@ -9,8 +9,10 @@ export const DENIED_OVERRIDE_KEYS = new Set([
   'chain',
   'chainDir',
   'chainName',
+  'cwd',
   'extensions',
   'fallbackModels',
+  'includeRaw',
   'model',
   'packages',
   'provider',
@@ -20,6 +22,7 @@ export const DENIED_OVERRIDE_KEYS = new Set([
   'skills',
   'systemPrompt',
   'thinking',
+  'unredacted',
   'tools',
   'worktree',
   'worktreeSetupHook',
@@ -28,10 +31,12 @@ export const DENIED_OVERRIDE_KEYS = new Set([
 const CONCURRENCY_KEYS = new Set(['concurrency', 'maxConcurrency']);
 const OUTPUT_HINT_KEYS = new Set(['output', 'outputMode']);
 const COMMON_KEYS = new Set(['action']);
-const SPAWN_KEYS = new Set(['action', 'agent', 'role', 'task', 'cwd']);
+const SPAWN_KEYS = new Set(['action', 'agent', 'role', 'task', 'timeoutMs']);
 const TARGET_KEYS = new Set(['action', 'childId', 'child_id', 'target', 'timeoutMs']);
 const SEND_INPUT_KEYS = new Set(['action', 'childId', 'child_id', 'target', 'message', 'timeoutMs']);
-const REVIVE_KEYS = new Set(['action', 'childId', 'child_id', 'target', 'task', 'cwd', 'timeoutMs']);
+const REVIVE_KEYS = new Set(['action', 'childId', 'child_id', 'target', 'task', 'timeoutMs']);
+const BATCH_KEYS = new Set(['action', 'childIds', 'timeoutMs']);
+const READ_OUTPUT_KEYS = new Set(['action', 'outputHandle', 'offset', 'maxChars']);
 
 export class FacadeSchemaError extends Error {
   constructor(message) {
@@ -95,6 +100,58 @@ function childTarget(payload) {
   return stringValue(payload.childId ?? payload.child_id ?? payload.target, 'childId');
 }
 
+function assertChildIdShape(childId) {
+  if (!/^sp-child-[A-Za-z0-9._-]+$/.test(childId)) {
+    throw new FacadeSchemaError(`stronk_subagent childId invalid: ${childId}`);
+  }
+}
+
+function childTargets(payload) {
+  if (!Array.isArray(payload.childIds)) {
+    throw new FacadeSchemaError('childIds must be an array');
+  }
+  if (payload.childIds.length < 1) {
+    throw new FacadeSchemaError('childIds must include at least one childId');
+  }
+  if (payload.childIds.length > MAX_CHILDREN) {
+    throw new FacadeSchemaError(`childIds exceeds max children: ${payload.childIds.length}>${MAX_CHILDREN}`);
+  }
+  const values = payload.childIds.map((value, index) => stringValue(value, `childIds.${index}`));
+  for (const value of values) assertChildIdShape(value);
+  const seen = new Set();
+  for (const value of values) {
+    if (seen.has(value)) {
+      throw new FacadeSchemaError(`stronk_subagent duplicate childId denied: ${value}`);
+    }
+    seen.add(value);
+  }
+  return values;
+}
+
+function outputHandle(payload) {
+  const handle = stringValue(payload.outputHandle, 'outputHandle');
+  if (!/^subagent-output-[a-f0-9-]{36}$/.test(handle)) {
+    throw new FacadeSchemaError('outputHandle invalid');
+  }
+  return handle;
+}
+
+function optionalOffset(value) {
+  if (value === undefined || value === null || value === '') return 0;
+  if (typeof value !== 'number' || !Number.isInteger(value) || value < 0) {
+    throw new FacadeSchemaError('offset must be a non-negative integer');
+  }
+  return value;
+}
+
+function optionalMaxChars(value) {
+  if (value === undefined || value === null || value === '') return 12000;
+  if (typeof value !== 'number' || !Number.isInteger(value) || value < 1 || value > 65536) {
+    throw new FacadeSchemaError('maxChars must be an integer from 1 to 65536');
+  }
+  return value;
+}
+
 export function normalizeFacadePayload(payload) {
   assertPlainObject(payload, 'stronk_subagent payload');
   walkDenied(payload);
@@ -104,6 +161,8 @@ export function normalizeFacadePayload(payload) {
     ...TARGET_KEYS,
     ...SEND_INPUT_KEYS,
     ...REVIVE_KEYS,
+    ...BATCH_KEYS,
+    ...READ_OUTPUT_KEYS,
   ]));
 
   const action = stringValue(payload.action, 'action');
@@ -119,7 +178,7 @@ export function normalizeFacadePayload(payload) {
       action,
       role,
       task,
-      cwd: optionalString(payload.cwd, 'cwd'),
+      timeoutMs: optionalTimeout(payload.timeoutMs),
     };
   }
 
@@ -139,8 +198,26 @@ export function normalizeFacadePayload(payload) {
       action,
       childId: childTarget(payload),
       task: optionalString(payload.task, 'task'),
-      cwd: optionalString(payload.cwd, 'cwd'),
       timeoutMs: optionalTimeout(payload.timeoutMs),
+    };
+  }
+
+  if (action === 'wait_all' || action === 'close_all') {
+    assertKnownKeys(payload, BATCH_KEYS);
+    return {
+      action,
+      childIds: childTargets(payload),
+      timeoutMs: optionalTimeout(payload.timeoutMs),
+    };
+  }
+
+  if (action === 'read_output') {
+    assertKnownKeys(payload, READ_OUTPUT_KEYS);
+    return {
+      action,
+      outputHandle: outputHandle(payload),
+      offset: optionalOffset(payload.offset),
+      maxChars: optionalMaxChars(payload.maxChars),
     };
   }
 
@@ -165,8 +242,16 @@ export const stronkSubagentSchema = {
     role: { type: 'string' },
     agent: { type: 'string' },
     task: { type: 'string' },
-    cwd: { type: 'string' },
     childId: { type: 'string' },
+    childIds: {
+      type: 'array',
+      minItems: 1,
+      maxItems: MAX_CHILDREN,
+      items: { type: 'string' },
+    },
+    outputHandle: { type: 'string' },
+    offset: { type: 'number', minimum: 0 },
+    maxChars: { type: 'number', minimum: 1, maximum: 65536 },
     child_id: { type: 'string' },
     target: { type: 'string' },
     message: { type: 'string' },

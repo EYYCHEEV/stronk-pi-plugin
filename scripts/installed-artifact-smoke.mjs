@@ -1,6 +1,8 @@
 #!/usr/bin/env node
 import assert from 'node:assert/strict';
-import { existsSync, mkdtempSync, readFileSync, realpathSync, rmSync, writeFileSync } from 'node:fs';
+import { spawnSync } from 'node:child_process';
+import { EventEmitter } from 'node:events';
+import { existsSync, mkdirSync, mkdtempSync, readFileSync, realpathSync, rmSync, writeFileSync } from 'node:fs';
 import { homedir, tmpdir } from 'node:os';
 import { dirname, join, resolve } from 'node:path';
 import { fileURLToPath, pathToFileURL } from 'node:url';
@@ -15,6 +17,7 @@ const stateRoot = process.env.STRONK_PI_STATE_ROOT || join(home, '.stronk-pi');
 const runtimeRoot = process.env.STRONK_PI_SMOKE_RUNTIME || join(stateRoot, 'pi-fork-runtime');
 const pluginPath = process.env.STRONK_PI_SMOKE_PLUGIN
   || join(stateRoot, `artifacts/stronk-pi-plugin-${pluginVersion}/package/src/index.mjs`);
+const runInstalledAgentSmoke = process.env.STRONK_PI_SMOKE_AGENT_RUN !== '0';
 
 if (!existsSync(pluginPath)) {
   throw new Error(`Stronk Pi plugin artifact not found: ${pluginPath}`);
@@ -69,6 +72,43 @@ function allowPromptHookCommandJson() {
   ]);
 }
 
+function parseToolJson(result) {
+  const text = result?.content?.[0]?.text;
+  assert.equal(typeof text, 'string');
+  return JSON.parse(text);
+}
+
+function assertNoDryRunPath(payload) {
+  const serialized = JSON.stringify(payload);
+  assert.doesNotMatch(serialized, /dry-run|dry_run_no_worker|skipped child execution/i);
+}
+
+function assertPublicPathClean(payload, forbidden = []) {
+  const serialized = JSON.stringify(payload);
+  assert.equal(Object.hasOwn(payload, 'artifacts'), false);
+  assert.doesNotMatch(serialized, /"cwd"\s*:\s*"(?:\/|file:)/);
+  assert.doesNotMatch(serialized, /\/Users\/|\/home\/|\/tmp\/|\/var\/folders\/|\/private\/var\/|\/root\/|\/etc\//);
+  assert.doesNotMatch(serialized, /file:\/\/\//);
+  for (const value of forbidden.filter(Boolean)) {
+    assert.equal(serialized.includes(value), false, `public result leaked ${value}`);
+  }
+}
+
+function assertNoSkippedChildText(text) {
+  assert.doesNotMatch(text, /dry[-_ ]run|dry_run_no_worker|skipped child execution|no launched worker|without launching a worker/i);
+}
+
+function unsubscribeEventBus() {
+  const emitter = new EventEmitter();
+  return {
+    emit: (...args) => emitter.emit(...args),
+    on: (event, listener) => {
+      emitter.on(event, listener);
+      return () => emitter.off(event, listener);
+    },
+  };
+}
+
 async function withEnv(values, action) {
   const previous = new Map();
   for (const [key, value] of Object.entries(values)) {
@@ -112,33 +152,264 @@ assert.equal(webSearchSchema.searchResultUrls?.type, 'array');
 
 const subagentStateRoot = mkdtempSync(join(tmpdir(), 'stronk-pi-installed-subagent-smoke.'));
 try {
+  const rolesDir = join(subagentStateRoot, 'roles');
+  mkdirSync(rolesDir, { recursive: true });
+  writeFileSync(join(rolesDir, 'executor.toml'), 'name = "executor"\n');
+  const roleManifest = join(subagentStateRoot, 'roles.toml');
+  writeFileSync(roleManifest, `codex_roles_dir = "${rolesDir}"\n`);
+  const events = unsubscribeEventBus();
+  const asyncIds = [
+    'installed-artifact-intercom-run-a',
+    'installed-artifact-intercom-run-b',
+    'installed-artifact-intercom-run-c',
+    'installed-artifact-intercom-run-close-fail',
+    'installed-artifact-intercom-run-capacity-retry',
+  ];
+  const closeFailAsyncId = asyncIds[3];
+  const resultDir = join(subagentStateRoot, 'async-subagent-results');
+  const requests = [];
+  let spawnIndex = 0;
+  let capacityBlockedOnce = false;
+
+  const asyncDirFor = (asyncId) => join(subagentStateRoot, 'async-subagent-runs', asyncId);
+  const resultPathFor = (asyncId) => join(resultDir, `${asyncId}.json`);
+  const writeStatus = (asyncId, patch = {}) => {
+    const asyncDir = asyncDirFor(asyncId);
+    mkdirSync(asyncDir, { recursive: true });
+    mkdirSync(resultDir, { recursive: true });
+    writeFileSync(join(asyncDir, 'status.json'), JSON.stringify({
+      runId: asyncId,
+      mode: 'single',
+      state: 'running',
+      startedAt: Date.now(),
+      lastUpdate: Date.now(),
+      pid: process.pid,
+      cwd: packageRoot,
+      steps: [{ agent: 'executor', status: 'running' }],
+      ...patch,
+    }, null, 2));
+    return asyncDir;
+  };
+  const completeRun = (asyncId, result) => {
+    writeStatus(asyncId, {
+      state: 'complete',
+      endedAt: Date.now(),
+      steps: [{ agent: 'executor', status: 'complete', exitCode: 0 }],
+    });
+    writeFileSync(resultPathFor(asyncId), JSON.stringify({
+      id: asyncId,
+      mode: 'single',
+      state: 'complete',
+      exitCode: 0,
+      ...result,
+    }, null, 2));
+  };
+
+  events.on('subagent:slash:request', (request) => {
+    requests.push(request);
+    events.emit('subagent:slash:started', { requestId: request.requestId });
+    if (request.params.action === 'interrupt') {
+      if (request.params.id === closeFailAsyncId) {
+        events.emit('subagent:slash:response', {
+          requestId: request.requestId,
+          isError: true,
+          result: { content: [{ type: 'text', text: 'simulated installed close failure' }] },
+        });
+        return;
+      }
+      events.emit('subagent:slash:response', {
+        requestId: request.requestId,
+        isError: false,
+        result: {
+          content: [{ type: 'text', text: `Interrupted async child ${request.params.id}` }],
+          details: { mode: 'management', results: [] },
+        },
+      });
+      return;
+    }
+
+    if (request.params.task === 'installed capacity blocked child' && !capacityBlockedOnce) {
+      capacityBlockedOnce = true;
+      events.emit('subagent:slash:response', {
+        requestId: request.requestId,
+        isError: true,
+        result: {
+          content: [{ type: 'text', text: 'HTTP 429 concurrent limit reached: 6/6 slots in use. Retry-After: 1s' }],
+          details: {
+            mode: 'single',
+            statusCode: 429,
+            retryAfterMs: 1000,
+            concurrency: { inUse: 6, limit: 6 },
+          },
+        },
+      });
+      return;
+    }
+
+    const asyncId = asyncIds[spawnIndex] || `installed-artifact-intercom-run-extra-${spawnIndex}`;
+    spawnIndex += 1;
+    const asyncDir = writeStatus(asyncId);
+    events.emit('subagent:async-started', { id: asyncId, asyncDir, pid: process.pid, mode: 'single', agent: 'executor' });
+    events.emit('subagent:slash:response', {
+      requestId: request.requestId,
+      isError: false,
+      result: {
+        content: [{ type: 'text', text: `Async: executor [${asyncId}]` }],
+        details: { mode: 'single', results: [], asyncId, asyncDir },
+      },
+    });
+  });
+
   await withEnv({
     STRONK_PI_SUBAGENT_FACADE: 'stronk',
-    STRONK_PI_SUBAGENT_ADAPTER: 'dry-run',
+    STRONK_PI_SUBAGENT_ADAPTER: 'intercom',
     STRONK_PI_STATE_ROOT: subagentStateRoot,
     STRONK_PI_FACADE_RUN_ID: 'installed-subagent-smoke',
     STRONK_PI_FACADE_DEBUG: '1',
+    STRONK_PI_ROLE_MANIFEST: roleManifest,
+    STRONK_PI_ROLE_MANIFEST_LOCAL: undefined,
   }, async () => {
     const subagentTools = [];
     await plugin.default({
+      events,
       on: () => {},
       registerTool: (tool) => subagentTools.push(tool),
     });
     const subagentByName = new Map(subagentTools.map((tool) => [tool.name, tool]));
-    assert.ok(subagentByName.has('stronk_subagent'));
+    const facade = subagentByName.get('stronk_subagent');
+    assert.ok(facade);
     assert.equal(subagentByName.has('subagent'), false);
 
-    const execute = plugin.internals.createSubagentFacade({ allowedRoles: new Set(['executor']) });
-    const result = JSON.parse((await execute({
+    const spawn = parseToolJson(await facade.execute({
       action: 'spawn',
       role: 'executor',
-      task: 'installed artifact subagent dry-run smoke',
-    })).text);
-    assert.equal(result.child.status, 'dry-run');
-    assert.equal(result.child.terminalResult, 'dry-run-completed');
-    assert.equal(result.child.pid, null);
-    assert.deepEqual(result.warnings?.map((warning) => warning.code), ['dry_run_no_worker']);
-    assert.doesNotMatch(readFileSync(result.artifacts.manifest, 'utf8'), /raw_subagent/);
+      task: 'installed artifact subagent intercom smoke',
+    }, undefined, undefined, { model: 'installed-smoke/model:xhigh' }));
+    assertNoDryRunPath(spawn);
+    assertPublicPathClean(spawn, [subagentStateRoot, packageRoot]);
+    assert.equal(spawn.child.status, 'running');
+    assert.equal(spawn.child.roleRequested, 'executor');
+    assert.equal(spawn.child.roleUsed, 'executor');
+    assert.equal(spawn.child.aliasResolved, false);
+    assert.equal(spawn.child.upstreamRunId, asyncIds[0]);
+    assert.equal(spawn.child.recommendedNextAction, 'wait_again');
+    assert.equal(requests[0].params.model, 'installed-smoke/model:xhigh');
+
+    completeRun(asyncIds[0], {
+      success: true,
+      summary: `installed artifact intercom child completed password=supersecret123 ${subagentStateRoot}/secret.txt ${'x'.repeat(9000)}`,
+      results: [{ agent: 'executor', output: `installed artifact intercom child completed ${subagentStateRoot}/secret.txt`, success: true }],
+    });
+
+    const waited = parseToolJson(await facade.execute({
+      action: 'wait',
+      childId: spawn.child.childId,
+      timeoutMs: 1000,
+    }));
+    assertNoDryRunPath(waited);
+    assertPublicPathClean(waited, [subagentStateRoot, packageRoot]);
+    assert.equal(waited.child.status, 'completed');
+    assert.equal(waited.child.isTerminal, true);
+    assert.match(waited.child.childOutputPreview, /installed artifact intercom child completed/);
+    assert.equal(waited.child.childOutputTruncated, true);
+    assert.equal(waited.child.childOutputBytes, Buffer.byteLength(waited.child.childOutputPreview, 'utf8'));
+    assert.match(waited.child.childOutputHash, /^[a-f0-9]{64}$/);
+    assert.match(waited.child.childOutputHandle, /^subagent-output-[a-f0-9-]+$/);
+    assert.doesNotMatch(waited.child.childOutputPreview, /supersecret123/);
+    assert.doesNotMatch(waited.child.childOutputPreview, new RegExp(subagentStateRoot.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')));
+    assert.equal(waited.child.recommendedNextAction, 'close_child');
+
+    const read = parseToolJson(await facade.execute({
+      action: 'read_output',
+      outputHandle: waited.child.childOutputHandle,
+      offset: 0,
+      maxChars: 12000,
+    }));
+    assertNoDryRunPath(read);
+    assertPublicPathClean(read, [subagentStateRoot, packageRoot]);
+    assert.match(read.output.chunk, /installed artifact intercom child completed/);
+    assert.doesNotMatch(read.output.chunk, /supersecret123/);
+    assert.equal(read.output.redacted, true);
+
+    const running = parseToolJson(await facade.execute({ action: 'spawn', role: 'executor', task: 'installed wait_all still running' }));
+    const failed = parseToolJson(await facade.execute({ action: 'spawn', role: 'executor', task: 'installed wait_all failed child' }));
+    const closeFail = parseToolJson(await facade.execute({ action: 'spawn', role: 'executor', task: 'installed close_all failure child' }));
+    completeRun(asyncIds[2], {
+      success: false,
+      summary: 'installed artifact failure visible',
+      results: [{ agent: 'executor', success: false, error: 'installed artifact failure visible' }],
+    });
+    const batch = parseToolJson(await facade.execute({
+      action: 'wait_all',
+      childIds: [spawn.child.childId, running.child.childId, failed.child.childId],
+      timeoutMs: 20,
+    }));
+    assertNoDryRunPath(batch);
+    assertPublicPathClean(batch, [subagentStateRoot, packageRoot]);
+    assert.equal(batch.children.length, 3);
+    assert.equal(batch.timedOut, true);
+    assert.deepEqual(batch.nonTerminalChildIds, [running.child.childId]);
+    assert.deepEqual(batch.failedChildIds, [failed.child.childId]);
+
+    const closed = parseToolJson(await facade.execute({
+      action: 'close_all',
+      childIds: [spawn.child.childId, running.child.childId, failed.child.childId, closeFail.child.childId],
+      timeoutMs: 1000,
+    }));
+    assertNoDryRunPath(closed);
+    assertPublicPathClean(closed, [subagentStateRoot, packageRoot]);
+    assert.equal(closed.children.length, 4);
+    assert.ok(closed.closedChildIds.includes(spawn.child.childId));
+    assert.ok(closed.cleanupVerifiedChildIds.includes(running.child.childId) || closed.children.find((child) => child.childId === running.child.childId)?.cleanupVerified === false);
+    assert.deepEqual(closed.failedCloseChildIds, [closeFail.child.childId]);
+    assert.equal(closed.children.find((child) => child.childId === closeFail.child.childId)?.closeError, 'stronk_subagent close failed: simulated installed close failure');
+    assert.equal(closed.children.find((child) => child.childId === spawn.child.childId)?.childOutputHandle, null);
+
+    const capacity = parseToolJson(await facade.execute({
+      action: 'spawn',
+      role: 'executor',
+      task: 'installed capacity blocked child',
+    }, undefined, undefined, { model: 'installed-smoke/model:xhigh' }));
+    assertNoDryRunPath(capacity);
+    assertPublicPathClean(capacity, [subagentStateRoot, packageRoot]);
+    assert.equal(capacity.child.status, 'failed');
+    assert.equal(capacity.child.failureClass, 'provider_capacity');
+    assert.equal(capacity.child.retryable, true);
+    assert.equal(capacity.child.retryAfterMs, 1000);
+    assert.equal(capacity.child.concurrencyInUse, 6);
+    assert.equal(capacity.child.concurrencyLimit, 6);
+    assert.equal(capacity.child.outputUsableForSynthesis, false);
+    assert.equal(capacity.child.childOutputHandle, null);
+    assert.equal(capacity.child.childOutputPreview, null);
+    assert.equal(capacity.child.recommendedNextAction, 'retry_capacity_children_next_batch');
+    assert.doesNotMatch(JSON.stringify(capacity), /concurrent limit reached|slots in use/i);
+
+    const revivedCapacity = parseToolJson(await facade.execute({
+      action: 'revive',
+      childId: capacity.child.childId,
+    }, undefined, undefined, { model: 'installed-smoke/model:xhigh' }));
+    assertNoDryRunPath(revivedCapacity);
+    assertPublicPathClean(revivedCapacity, [subagentStateRoot, packageRoot]);
+    assert.equal(revivedCapacity.previousChildId, capacity.child.childId);
+    assert.equal(revivedCapacity.child.previousChildId, capacity.child.childId);
+    assert.equal(revivedCapacity.child.status, 'running');
+    assert.equal(revivedCapacity.child.upstreamRunId, asyncIds[4]);
+    assert.equal(requests.at(-1).params.agent, 'executor');
+    assert.equal(requests.at(-1).params.task, 'installed capacity blocked child');
+    assert.equal(requests.at(-1).params.model, 'installed-smoke/model:xhigh');
+    assert.equal(Object.hasOwn(requests.at(-1).params, 'fallbackModels'), false);
+    assert.equal(Object.hasOwn(requests.at(-1).params, 'provider'), false);
+    assert.equal(Object.hasOwn(requests.at(-1).params, 'concurrency'), false);
+
+    const capacityClosed = parseToolJson(await facade.execute({
+      action: 'close_all',
+      childIds: [capacity.child.childId, revivedCapacity.child.childId],
+      timeoutMs: 1000,
+    }));
+    assertNoDryRunPath(capacityClosed);
+    assertPublicPathClean(capacityClosed, [subagentStateRoot, packageRoot]);
+    assert.equal(capacityClosed.children.length, 2);
+    assert.equal(capacityClosed.failedCloseChildIds.length, 0);
   });
 } finally {
   rmSync(subagentStateRoot, { recursive: true, force: true });
@@ -430,4 +701,97 @@ assert.equal(finishedReview.details.review.keptResults.length, 2);
 assert.ok(finishedReview.details.review.keptResults.every((item) => item.fetchRecommendedBeforeUse === true));
 assert.match(finishedReview.content?.[0]?.text ?? '', /Content: snippet-only; fetch_content recommended before citation/);
 
-console.log(`installed artifact mock smoke: ok (${pluginPath})`);
+if (runInstalledAgentSmoke) {
+  const agentRunRoot = mkdtempSync(join(tmpdir(), 'stronk-pi-installed-agent-run-smoke.'));
+  try {
+    const promptPath = join(agentRunRoot, 'installed-agent-run.prompt.md');
+    writeFileSync(promptPath, [
+      'Use only the `stronk_subagent` tool.',
+      'Do not call the raw upstream subagent tool.',
+      'Run this through a real child agent execution path.',
+      'If the child result indicates a mocked worker, skipped child execution, or no launched worker, stop and report failure.',
+      '',
+      '1. Spawn three role `executor` children with tasks that do not modify files.',
+      '   Child A must return a long output containing the token below, plus a fake local path `/tmp/stronk-pi-should-redact`, plus `password=supersecret123`, plus enough filler text that the preview is truncated and a `childOutputHandle` is produced.',
+      '   Child B must stay non-terminal for at least 30 seconds before returning exactly `STATUS_TOKEN=STRONK_PI_WAIT_ALL_RUNNING_CHILD_DONE`.',
+      '   Child C must visibly report a failure or failed finding without modifying files.',
+      '',
+      '```text',
+      'STATUS_TOKEN=STRONK_PI_INSTALLED_AGENT_RUN_OK',
+      '```',
+      '',
+      '2. Call `wait_all` with all three child IDs and `timeoutMs=1000` before Child B finishes.',
+      '3. Confirm the parent-visible batch result has exactly three children in request order, no `cwd`, no raw local paths, no debug artifact paths, failure visibility for Child C, and one non-terminal timeout entry for Child B.',
+      '4. Use `read_output` on Child A `childOutputHandle` with chunking. Confirm the handle is opaque, output is redacted, and no raw output path is visible.',
+      '5. Call `close_all` on all three child IDs and confirm per-child cleanup fields are present. Confirm close failure arrays are visible in the schema, even if all real closes succeed.',
+      '6. Run negative checks through `stronk_subagent`: duplicate child ID in `wait_all` must be denied, a foreign child ID must be denied, and an invalid output handle must be denied.',
+      '7. Recheck any file-line citations in the final answer against current files if you cite a file.',
+      '8. Final answer must include exactly these lines:',
+      '',
+      '```text',
+      'STATUS_TOKEN=STRONK_PI_INSTALLED_AGENT_RUN_OK',
+      'STATUS_TOKEN=STRONK_PI_PUBLIC_PATH_REDACTION_OK',
+      'NO_CWD_IN_PUBLIC_RESULT=true',
+      'DEBUG_ARTIFACT_PATHS_NOT_PUBLIC=true',
+      'STATUS_TOKEN=STRONK_PI_WAIT_ALL_OK',
+      'WAIT_ALL_CHILDREN=3',
+      'WAIT_ALL_TIMEOUT_NONTERMINAL=true',
+      'WAIT_ALL_FAILURE_VISIBLE=true',
+      'STATUS_TOKEN=STRONK_PI_READ_OUTPUT_OK',
+      'OUTPUT_HANDLE_OPAQUE=true',
+      'READ_OUTPUT_CHUNKED=true',
+      'READ_OUTPUT_REDACTED=true',
+      'NO_RAW_OUTPUT_PATH=true',
+      'STATUS_TOKEN=STRONK_PI_BATCH_CLOSE_OK',
+      'CLEANUP_REPORTED_PER_CHILD=true',
+      'CLOSE_FAILURE_NOT_HIDDEN=true',
+      'STATUS_TOKEN=STRONK_PI_NEGATIVE_BATCH_OK',
+      'DUPLICATE_CHILD_DENIED=true',
+      'FOREIGN_CHILD_DENIED=true',
+      'INVALID_OUTPUT_HANDLE_DENIED=true',
+      'STATUS_TOKEN=STRONK_PI_CITATION_OK',
+      'FILE_LINE_RECHECKED_AT_SYNTHESIS=true',
+      '```',
+      '',
+    ].join('\n'));
+
+    const stronkpi = process.env.STRONK_PI_SMOKE_STRONKPI || 'stronkpi';
+    const model = process.env.STRONK_PI_SMOKE_MODEL || 'deepseek/deepseek-v4-pro:high';
+    const run = spawnSync(stronkpi, ['--model', model, '--no-session', '-p', `@${promptPath}`], {
+      cwd: packageRoot,
+      encoding: 'utf8',
+      timeout: Number(process.env.STRONK_PI_SMOKE_AGENT_TIMEOUT_MS || 3600000),
+      env: process.env,
+      maxBuffer: 1024 * 1024 * 20,
+    });
+    const combined = `${run.stdout || ''}\n${run.stderr || ''}`;
+    assertNoSkippedChildText(combined);
+    assert.equal(run.status, 0, `installed agent-run smoke failed with status ${run.status}\n${combined}`);
+    assert.match(combined, /STATUS_TOKEN=STRONK_PI_INSTALLED_AGENT_RUN_OK/);
+    assert.match(combined, /STATUS_TOKEN=STRONK_PI_PUBLIC_PATH_REDACTION_OK/);
+    assert.match(combined, /NO_CWD_IN_PUBLIC_RESULT=true/);
+    assert.match(combined, /DEBUG_ARTIFACT_PATHS_NOT_PUBLIC=true/);
+    assert.match(combined, /STATUS_TOKEN=STRONK_PI_WAIT_ALL_OK/);
+    assert.match(combined, /WAIT_ALL_CHILDREN=3/);
+    assert.match(combined, /WAIT_ALL_TIMEOUT_NONTERMINAL=true/);
+    assert.match(combined, /WAIT_ALL_FAILURE_VISIBLE=true/);
+    assert.match(combined, /STATUS_TOKEN=STRONK_PI_READ_OUTPUT_OK/);
+    assert.match(combined, /OUTPUT_HANDLE_OPAQUE=true/);
+    assert.match(combined, /READ_OUTPUT_CHUNKED=true/);
+    assert.match(combined, /READ_OUTPUT_REDACTED=true/);
+    assert.match(combined, /NO_RAW_OUTPUT_PATH=true/);
+    assert.match(combined, /STATUS_TOKEN=STRONK_PI_BATCH_CLOSE_OK/);
+    assert.match(combined, /CLEANUP_REPORTED_PER_CHILD=true/);
+    assert.match(combined, /CLOSE_FAILURE_NOT_HIDDEN=true/);
+    assert.match(combined, /STATUS_TOKEN=STRONK_PI_NEGATIVE_BATCH_OK/);
+    assert.match(combined, /DUPLICATE_CHILD_DENIED=true/);
+    assert.match(combined, /FOREIGN_CHILD_DENIED=true/);
+    assert.match(combined, /INVALID_OUTPUT_HANDLE_DENIED=true/);
+    assert.match(combined, /STATUS_TOKEN=STRONK_PI_CITATION_OK/);
+    assert.match(combined, /FILE_LINE_RECHECKED_AT_SYNTHESIS=true/);
+  } finally {
+    rmSync(agentRunRoot, { recursive: true, force: true });
+  }
+}
+
+console.log(`installed artifact smoke: ok (${pluginPath})`);

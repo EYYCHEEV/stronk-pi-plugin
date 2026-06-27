@@ -96,6 +96,54 @@ takes that name.
 - `stronk_subagent` requires an explicit role manifest from the harness. The
   default manifest is `~/.stronk-pi/config/roles.toml`; the optional local
   overlay is `~/.stronk-pi/config/roles.local.toml`.
+- `stronk_subagent` is the only public Stronk-owned subagent lifecycle tool.
+  Raw upstream `subagent` calls and user-supplied model, tool, skill, worktree,
+  chain, context, background, and output-path overrides are denied.
+- Public `stronk_subagent` results are path-clean.
+  They do not expose child `cwd`, upstream temp paths, durable output paths,
+  private ledger paths, or debug artifact paths.
+  Debug mode may expose non-path diagnostics such as run IDs, project refs,
+  counts, hashes, and booleans.
+- Child runs use fresh context.
+  Parent-loaded `$skill` content is passed through the prompt context rather
+  than through public `skills` override fields.
+- Role aliases are transparent in tool results.
+  Check `roleRequested`, `roleUsed`, and `aliasResolved` in role routing
+  reports instead of assuming the requested role is what ran.
+- Use long waits for real child work.
+  If a wait returns `timedOut=true`, follow `recommendedNextAction` and wait
+  again or diagnose rather than treating the child as terminal.
+- Use `wait_all` when coordinating multiple known children.
+  Pass explicit current-run `childIds`; duplicate, invalid, over-limit,
+  unknown, or foreign child IDs are denied before waiting starts.
+  Batch results preserve request order and show terminal, non-terminal, failed,
+  and timed-out children separately.
+- Provider capacity failures are retryable lifecycle state, not child findings.
+  When a child has `failureClass="provider_capacity"`, `retryable=true`, or
+  `retryableCapacityChildIds` in `wait_all`, do not synthesize from that child.
+  If `retryPolicy="after_retry_after"`, wait for `nextRetryAfterMs`; if
+  `retryPolicy="after_nonterminal_drain"`, wait for the rest of the batch to
+  finish first.
+  Then use guarded `revive` to retry capacity-blocked children in the next batch.
+  Do not switch models, add fallback models, or add provider/concurrency
+  overrides.
+  Capacity error prose is intentionally not exposed as readable child output.
+- Terminal children may include an opaque `childOutputHandle` when the full
+  sanitized output is larger than the preview.
+  Use `read_output` with `outputHandle`, `offset`, and `maxChars` for bounded
+  chunks.
+  Handles are not paths and are invalidated when the child is closed.
+- Use `close_all` for explicit batch cleanup.
+  A valid batch close can still report per-child close or cleanup failures;
+  inspect `failedCloseChildIds`, `cleanupFailedChildIds`, `cleanupState`,
+  `processLive`, and `cleanupVerified` instead of treating aggregate tool
+  success as proof that every child cleaned up.
+- Do not synthesize from partial lifecycle state.
+  Wait until every child is terminal, then close completed children after
+  synthesis and report `cleanupState`, `processLive`, and `cleanupVerified`.
+- Recheck file-line citations at synthesis time.
+  Child output can be stale; cite current file references only after rereading
+  the referenced lines.
 - When Pi UI exposes `ctx.ui.addAutocompleteProvider`, Stronk Pi layers
   metadata-only `$skill` autocomplete on top of the built-in composer;
   submitted-prompt injection remains the source of truth.
@@ -103,8 +151,8 @@ takes that name.
   launcher: `pi-ask-user` for `ask_user`.
 - `apply_patch` stays denied until a full patch parser and shared hook
   validation path exists.
-- On normal interactive shutdown, Stronk Pi prints a Pi-native
-  `pi --session <id>` resume hint when a persisted session is available.
+- On normal interactive shutdown, Stronk Pi prints a wrapper-owned
+  `stronkpi --session <id>` resume hint when a persisted session is available.
 - No secrets belong in this repo.
 
 Run checks:

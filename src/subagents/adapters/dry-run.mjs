@@ -37,12 +37,18 @@ export class DryRunSubagentAdapter {
     if (isTerminalStatus(child.status)) {
       return ledger.updateChild(childId, {
         cleanupState: child.cleanupState === 'closed' ? 'closed' : 'already_closed',
+        closeRequested: false,
+        processLive: null,
+        cleanupVerified: false,
         terminalResult: child.terminalResult ?? child.status,
       }, 'child_already_closed');
     }
     return ledger.updateChild(childId, {
       status: 'closed',
       cleanupState: 'closed',
+      closeRequested: true,
+      processLive: null,
+      cleanupVerified: false,
       terminalResult: child.terminalResult ?? 'closed',
     }, 'child_closed');
   }
@@ -53,6 +59,9 @@ export class DryRunSubagentAdapter {
     return ledger.updateChild(childId, {
       status: isTerminalStatus(child.status) ? child.status : 'interrupted',
       cleanupState: 'interrupted',
+      closeRequested: !isTerminalStatus(child.status),
+      processLive: null,
+      cleanupVerified: false,
       terminalResult: child.terminalResult ?? 'interrupted',
     }, 'child_interrupted');
   }
