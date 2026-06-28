@@ -4087,46 +4087,170 @@ function discoverSkillsFromRoot(root, { includeContents = true } = {}) {
   return skills;
 }
 
-function loadSkillInventory(rawRoots = process.env.STRONK_PI_SKILL_ROOTS) {
+function loadSkillInventory(rawRoots = process.env.STRONK_PI_SKILL_ROOTS, options = {}) {
+  const hostSkills = resolveHostSkills(options);
+  return loadCombinedSkillInventory(rawRoots, {
+    hostSkills,
+    includeContents: true,
+  });
+}
+
+function loadSkillCatalog(rawRoots = process.env.STRONK_PI_SKILL_ROOTS, options = {}) {
+  const hostSkills = resolveHostSkills(options);
+  return loadCombinedSkillInventory(rawRoots, {
+    hostSkills,
+    includeContents: false,
+  });
+}
+
+function loadRootSkillInventory(rawRoots = process.env.STRONK_PI_SKILL_ROOTS, options = {}) {
   const roots = parseSkillRoots(rawRoots);
   const skills = [];
   const seenPaths = new Set();
   for (const root of roots) {
-    for (const skill of discoverSkillsFromRoot(root)) {
+    for (const skill of discoverSkillsFromRoot(root, { includeContents: options.includeContents !== false })) {
       if (seenPaths.has(skill.path)) continue;
       seenPaths.add(skill.path);
       skills.push(skill);
     }
   }
-  skills.sort((a, b) => {
-    const scopeDelta = (SKILL_SCOPE_RANK.get(a.scope) ?? 1) - (SKILL_SCOPE_RANK.get(b.scope) ?? 1);
-    if (scopeDelta !== 0) return scopeDelta;
-    const nameDelta = a.name.localeCompare(b.name);
-    if (nameDelta !== 0) return nameDelta;
-    return a.path.localeCompare(b.path);
-  });
+  skills.sort(compareSkillsForMention);
   return { roots, skills };
 }
 
-function loadSkillCatalog(rawRoots = process.env.STRONK_PI_SKILL_ROOTS) {
-  const roots = parseSkillRoots(rawRoots);
+function mergeSkillInventories(hostInventory, rootInventory) {
+  if (!hostInventory) return rootInventory ?? { roots: [], skills: [] };
+  if (!rootInventory) return hostInventory;
+  if (!hostInventory.skills.length) return rootInventory;
+
+  const roots = [];
   const skills = [];
+  const seenRoots = new Set();
   const seenPaths = new Set();
-  for (const root of roots) {
-    for (const skill of discoverSkillsFromRoot(root, { includeContents: false })) {
+  const hostNames = new Set(hostInventory.skills.map((skill) => skill.name));
+  for (const inventory of [hostInventory, rootInventory]) {
+    if (!inventory) continue;
+    for (const root of inventory.roots ?? []) {
+      const rootKey = `${root.scope}\0${root.path}`;
+      if (seenRoots.has(rootKey)) continue;
+      seenRoots.add(rootKey);
+      roots.push(root);
+    }
+    for (const skill of inventory.skills ?? []) {
       if (seenPaths.has(skill.path)) continue;
+      if (inventory === rootInventory && hostNames.has(skill.name)) continue;
       seenPaths.add(skill.path);
       skills.push(skill);
     }
   }
-  skills.sort((a, b) => {
-    const scopeDelta = (SKILL_SCOPE_RANK.get(a.scope) ?? 1) - (SKILL_SCOPE_RANK.get(b.scope) ?? 1);
-    if (scopeDelta !== 0) return scopeDelta;
-    const nameDelta = a.name.localeCompare(b.name);
-    if (nameDelta !== 0) return nameDelta;
-    return a.path.localeCompare(b.path);
-  });
+  skills.sort(compareSkillsForMention);
   return { roots, skills };
+}
+
+function loadCombinedSkillInventory(rawRoots = process.env.STRONK_PI_SKILL_ROOTS, options = {}) {
+  const hostInventory = options.hostSkills
+    ? loadHostSkillInventory(options.hostSkills, { includeContents: options.includeContents !== false })
+    : undefined;
+  let rootInventory;
+  try {
+    rootInventory = loadRootSkillInventory(rawRoots, { includeContents: options.includeContents !== false });
+  } catch (error) {
+    if (!hostInventory) throw error;
+  }
+  return mergeSkillInventories(hostInventory, rootInventory);
+}
+
+function resolveHostSkills(options = {}) {
+  if (!options || typeof options !== 'object') return undefined;
+  if (typeof options.getSkills === 'function') {
+    const skills = options.getSkills();
+    return Array.isArray(skills) ? skills : [];
+  }
+  if (Array.isArray(options.hostSkills)) return options.hostSkills;
+  if (Array.isArray(options.skills)) return options.skills;
+  return undefined;
+}
+
+function normalizeHostSkillScope(skill) {
+  const scope = skill?.sourceInfo?.scope;
+  if (scope === 'project') return 'repo';
+  if (typeof scope === 'string' && scope.trim()) return scope;
+  return 'user';
+}
+
+function normalizeHostSkillPath(skill) {
+  const filePath = skill?.filePath ?? skill?.path;
+  if (typeof filePath !== 'string' || !filePath.trim()) return undefined;
+  const absolute = resolve(filePath);
+  try {
+    return { path: absolute, realPath: realpathSync(absolute) };
+  } catch {
+    return { path: absolute, realPath: absolute };
+  }
+}
+
+function normalizeHostSkillRoot(skill, skillPath, scope) {
+  const rawRoot = firstString(skill?.baseDir, skill?.sourceInfo?.baseDir) || dirname(skillPath);
+  const rootPath = resolve(rawRoot);
+  try {
+    return { path: realpathSync(rootPath), scope };
+  } catch {
+    return { path: rootPath, scope };
+  }
+}
+
+function normalizeHostSkill(skill, options = {}) {
+  if (!skill || typeof skill.name !== 'string' || !skill.name.trim()) return undefined;
+  const resolvedPath = normalizeHostSkillPath(skill);
+  if (!resolvedPath) return undefined;
+  const scope = normalizeHostSkillScope(skill);
+  let contents = typeof skill.contents === 'string' ? skill.contents : undefined;
+  if (options.includeContents && contents === undefined) {
+    try {
+      contents = readFileSync(resolvedPath.path, 'utf8');
+    } catch {
+      return undefined;
+    }
+  }
+  const record = {
+    name: skill.name,
+    description: typeof skill.description === 'string' ? skill.description : '',
+    path: resolvedPath.path,
+    realPath: resolvedPath.realPath,
+    scope,
+  };
+  if (options.includeContents) record.contents = contents ?? '';
+  return record;
+}
+
+function loadHostSkillInventory(hostSkills, options = {}) {
+  const skills = [];
+  const roots = [];
+  const seenPaths = new Set();
+  const seenRoots = new Set();
+  for (const hostSkill of hostSkills) {
+    const skill = normalizeHostSkill(hostSkill, options);
+    if (!skill || seenPaths.has(skill.path)) continue;
+    seenPaths.add(skill.path);
+    skills.push(skill);
+
+    const root = normalizeHostSkillRoot(hostSkill, skill.path, skill.scope);
+    const rootKey = `${root.scope}\0${root.path}`;
+    if (!seenRoots.has(rootKey)) {
+      seenRoots.add(rootKey);
+      roots.push(root);
+    }
+  }
+  skills.sort(compareSkillsForMention);
+  return { roots, skills };
+}
+
+function compareSkillsForMention(a, b) {
+  const scopeDelta = (SKILL_SCOPE_RANK.get(a.scope) ?? 1) - (SKILL_SCOPE_RANK.get(b.scope) ?? 1);
+  if (scopeDelta !== 0) return scopeDelta;
+  const nameDelta = a.name.localeCompare(b.name);
+  if (nameDelta !== 0) return nameDelta;
+  return a.path.localeCompare(b.path);
 }
 
 function isMentionNameChar(ch) {
@@ -4276,7 +4400,7 @@ function selectMentionedSkills(text, inventory, cwd = process.cwd()) {
   }
 
   for (const skill of inventory.skills) {
-    const linkedNames = linkedSkillNamesByPath.get(skill.path);
+    const linkedNames = linkedSkillNamesByPath.get(skill.path) ?? linkedSkillNamesByPath.get(skill.realPath);
     if (!linkedNames || seenPaths.has(skill.path)) continue;
     if (!linkedNames.has(skill.name) || linkedNames.size !== 1) {
       throw new Error(`linked mention display name mismatch for ${skill.path}`);
@@ -4305,7 +4429,7 @@ function formatSkillBlock(skill) {
 
 function buildSkillInjectionContext(text, options = {}) {
   if (typeof text !== 'string' || !text.includes('$')) return { blocks: [], warnings: [] };
-  const inventory = loadSkillInventory(options.rootsJson ?? process.env.STRONK_PI_SKILL_ROOTS);
+  const inventory = loadSkillInventory(options.rootsJson ?? process.env.STRONK_PI_SKILL_ROOTS, options);
   const selected = selectMentionedSkills(text, inventory, resolve(options.cwd || process.cwd()));
   const blocks = [];
   const warnings = [];
@@ -4334,6 +4458,21 @@ function extractSkillAutocompleteContext(text) {
   };
 }
 
+function normalizeSkillSearchText(value) {
+  return String(value ?? '').toLowerCase().replace(/[^a-z0-9]+/g, '');
+}
+
+function skillNameMatchesAutocompleteQuery(name, query) {
+  if (!query) return true;
+  const rawName = String(name ?? '').toLowerCase();
+  const rawQuery = String(query ?? '').toLowerCase();
+  if (rawName.startsWith(rawQuery)) return true;
+  const normalizedName = normalizeSkillSearchText(rawName);
+  const normalizedQuery = normalizeSkillSearchText(rawQuery);
+  if (!normalizedQuery) return true;
+  return normalizedName.includes(normalizedQuery);
+}
+
 function formatSkillAutocompleteDescription(skill, isDuplicate) {
   const parts = [];
   if (isDuplicate) parts.push(skill.scope);
@@ -4348,13 +4487,13 @@ function buildSkillAutocompleteSuggestions(textBeforeCursor, options = {}) {
 
   let catalog;
   try {
-    catalog = loadSkillCatalog(options.rootsJson ?? process.env.STRONK_PI_SKILL_ROOTS);
+    catalog = loadSkillCatalog(options.rootsJson ?? process.env.STRONK_PI_SKILL_ROOTS, options);
   } catch {
     return null;
   }
   if (!catalog.skills.length) return null;
 
-  const query = context.partial.toLowerCase();
+  const query = context.partial;
   const nameCounts = new Map();
   for (const skill of catalog.skills) {
     nameCounts.set(skill.name, (nameCounts.get(skill.name) ?? 0) + 1);
@@ -4362,7 +4501,7 @@ function buildSkillAutocompleteSuggestions(textBeforeCursor, options = {}) {
 
   const items = [];
   for (const skill of catalog.skills) {
-    if (query && !skill.name.toLowerCase().startsWith(query)) continue;
+    if (!skillNameMatchesAutocompleteQuery(skill.name, query)) continue;
 
     const isDuplicate = (nameCounts.get(skill.name) ?? 0) > 1;
     items.push({
@@ -4397,17 +4536,19 @@ function applySkillAutocompleteCompletion(lines, cursorLine, cursorCol, item, pr
 
 function createSkillAutocompleteProvider(current, options = {}) {
   const rootsJson = options.rootsJson ?? process.env.STRONK_PI_SKILL_ROOTS;
+  const getSkills = typeof options.getSkills === 'function' ? options.getSkills : undefined;
+  const hostSkills = Array.isArray(options.hostSkills) ? options.hostSkills : undefined;
   return {
     triggerCharacters: ['$'],
-    async getSuggestions(lines, cursorLine, cursorCol, options) {
+    async getSuggestions(lines, cursorLine, cursorCol, requestOptions) {
       const currentLine = lines[cursorLine] || '';
       const textBeforeCursor = currentLine.slice(0, cursorCol);
       const context = extractSkillAutocompleteContext(textBeforeCursor);
       if (!context) {
-        return current.getSuggestions(lines, cursorLine, cursorCol, options);
+        return current.getSuggestions(lines, cursorLine, cursorCol, requestOptions);
       }
       if (context.suppressed) return null;
-      return buildSkillAutocompleteSuggestions(textBeforeCursor, { ...options, rootsJson }) ?? null;
+      return buildSkillAutocompleteSuggestions(textBeforeCursor, { ...requestOptions, rootsJson, getSkills, hostSkills }) ?? null;
     },
     applyCompletion(lines, cursorLine, cursorCol, item, prefix) {
       if (extractSkillAutocompleteContext(prefix)) {
@@ -4428,9 +4569,14 @@ function installSkillAutocompleteProvider(ctx = {}) {
   if (!ctx?.hasUI || !ctx.ui || typeof ctx.ui.addAutocompleteProvider !== 'function') return false;
   if (registeredSkillAutocompleteUIs.has(ctx.ui)) return false;
   const rootsJson = process.env.STRONK_PI_SKILL_ROOTS;
-  ctx.ui.addAutocompleteProvider((current) => createSkillAutocompleteProvider(current, { rootsJson }));
+  const getSkills = typeof ctx.getSkills === 'function' ? () => ctx.getSkills() : undefined;
+  ctx.ui.addAutocompleteProvider((current) => createSkillAutocompleteProvider(current, { rootsJson, getSkills }));
   registeredSkillAutocompleteUIs.add(ctx.ui);
   return true;
+}
+
+function forgetSkillAutocompleteProvider(ctx = {}) {
+  if (ctx?.ui) registeredSkillAutocompleteUIs.delete(ctx.ui);
 }
 
 async function handleInput(event, ctx = {}) {
@@ -4452,6 +4598,7 @@ async function handleInput(event, ctx = {}) {
     if (typeof event?.text === 'string') {
       skillContext = buildSkillInjectionContext(event.text, {
         cwd: firstString(event.cwd, ctx.cwd) || process.cwd(),
+        getSkills: typeof ctx.getSkills === 'function' ? () => ctx.getSkills() : undefined,
       });
     }
   } catch (error) {
@@ -8391,6 +8538,7 @@ function writeSessionResumeHint(message) {
 }
 
 function handleSessionShutdown(event, ctx = {}, write = writeSessionResumeHint) {
+  forgetSkillAutocompleteProvider(ctx);
   const message = buildSessionResumeHint(event, ctx);
   if (!message) return undefined;
   try {
