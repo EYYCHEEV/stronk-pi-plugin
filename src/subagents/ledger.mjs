@@ -472,6 +472,7 @@ export class SubagentLedger {
     const nextOffset = offset + [...chunk].length;
     return {
       handle,
+      childId: child.childId,
       chunk,
       offset,
       nextOffset,

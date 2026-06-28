@@ -6870,6 +6870,10 @@ test('raw upstream subagent tool is denied while guarded stronk_subagent remains
     });
     assert.equal(raw.block, true);
     assert.match(raw.reason, /raw subagent tool denied|unknown tool denied/);
+    assert.match(raw.reason, /stronk_subagent/);
+    assert.match(raw.reason, /wait_all/);
+    assert.match(raw.reason, /read_output/);
+    assert.match(raw.reason, /close_all/);
 
     const guarded = await internals.handleToolCall({
       toolName: 'stronk_subagent',
