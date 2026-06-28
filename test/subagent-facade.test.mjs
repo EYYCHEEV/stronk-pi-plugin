@@ -1191,6 +1191,26 @@ test('stronk_subagent maps scout aliases to available read-only roles', async ()
   });
 });
 
+test('stronk_subagent preserves requested role when it is directly allowed', async () => {
+  const stateRoot = mkdtempSync(join(tmpdir(), 'stronk-pi-facade-direct-role.'));
+
+  await withEnv({
+    STRONK_PI_STATE_ROOT: stateRoot,
+    STRONK_PI_FACADE_RUN_ID: 'facade-direct-role-run',
+    STRONK_PI_SUBAGENT_ADAPTER: 'dry-run',
+  }, async () => {
+    const execute = createSubagentFacade({
+      allowedRoles: new Set(['scout', 'technical-researcher', 'explorer']),
+    });
+    const result = parseResult(await execute({ action: 'spawn', role: 'scout', task: 'inspect docs' }));
+
+    assert.equal(result.child.role, 'scout');
+    assert.equal(result.child.roleRequested, 'scout');
+    assert.equal(result.child.roleUsed, 'scout');
+    assert.equal(result.child.aliasResolved, false);
+  });
+});
+
 test('stronk_subagent role denial lists allowed roles', async () => {
   const stateRoot = mkdtempSync(join(tmpdir(), 'stronk-pi-facade-role-denial.'));
 
@@ -1242,6 +1262,28 @@ test('stronk_subagent returns actionable errors for unknown child and non-termin
       () => liveExecute({ action: 'revive', childId: spawn.child.childId, task: 'should not revive running child' }),
       /stronk_subagent revive denied: child is not terminal/,
     );
+  });
+});
+
+test('stronk_subagent list returns current-run children without childId tracking gaps', async () => {
+  const stateRoot = mkdtempSync(join(tmpdir(), 'stronk-pi-facade-list.'));
+
+  await withEnv({
+    STRONK_PI_STATE_ROOT: stateRoot,
+    STRONK_PI_FACADE_RUN_ID: 'facade-list-run',
+    STRONK_PI_SUBAGENT_ADAPTER: 'dry-run',
+  }, async () => {
+    const execute = createSubagentFacade({ allowedRoles: new Set(['executor', 'technical-researcher']) });
+    const first = parseResult(await execute({ action: 'spawn', role: 'executor', task: 'first' }));
+    const second = parseResult(await execute({ action: 'spawn', role: 'technical-researcher', task: 'second' }));
+
+    const listed = parseResult(await execute({ action: 'list' }));
+
+    assert.equal(listed.action, 'list');
+    assert.deepEqual(listed.children.map((child) => child.childId), [first.child.childId, second.child.childId]);
+    assert.deepEqual(listed.children.map((child) => child.role), ['executor', 'technical-researcher']);
+    const listEvent = ledgerEventsForRun(stateRoot, 'facade-list-run').find((event) => event.event === 'facade_list');
+    assert.deepEqual(listEvent.childIds, [first.child.childId, second.child.childId]);
   });
 });
 
@@ -1299,11 +1341,19 @@ test('stronk_subagent revive creates a new child linked to previous terminal chi
     const execute = createSubagentFacade({ allowedRoles: new Set(['executor']) });
     const spawn = parseResult(await execute({ action: 'spawn', role: 'executor', task: 'finish first' }));
     const revived = parseResult(await execute({ action: 'revive', childId: spawn.child.childId, task: 'revived task' }));
+    const revivedViaMessage = parseResult(await execute({ action: 'revive', childId: spawn.child.childId, message: 'revived via message' }));
 
     assert.equal(revived.previousChildId, spawn.child.childId);
     assert.notEqual(revived.child.childId, spawn.child.childId);
     assert.equal(revived.child.previousChildId, spawn.child.childId);
     assert.equal(revived.child.status, 'dry-run');
+    assert.equal(revivedViaMessage.previousChildId, spawn.child.childId);
+    assert.notEqual(revivedViaMessage.child.childId, spawn.child.childId);
+    assert.equal(revivedViaMessage.child.previousChildId, spawn.child.childId);
+    await assert.rejects(
+      () => execute({ action: 'revive', childId: spawn.child.childId, task: 'task text', message: 'different message' }),
+      /revive accepts task or message, not both/,
+    );
   });
 });
 
@@ -1824,6 +1874,96 @@ test('stronk_subagent intercom wait classifies independent upstream failure sign
       });
     }
   }
+});
+
+test('stronk_subagent intercom wait treats positive complete output as completed despite stale failed step', async () => {
+  const stateRoot = mkdtempSync(join(tmpdir(), 'stronk-pi-facade-stale-step.'));
+  const asyncRoot = mkdtempSync(join(tmpdir(), 'stronk-pi-upstream-stale-step.'));
+  const asyncId = 'async-stale-step-run';
+  const events = new FakeEvents();
+  const { asyncDir, resultPath } = registerSimpleIntercomRun(events, { stateRoot, asyncRoot, asyncId });
+
+  await withEnv({
+    STRONK_PI_STATE_ROOT: stateRoot,
+    STRONK_PI_FACADE_RUN_ID: 'facade-stale-step-run',
+    STRONK_PI_SUBAGENT_ADAPTER: 'intercom',
+  }, async () => {
+    const adapter = new PiSubagentsBridgeAdapter({ events, timeoutMs: 1000 });
+    const execute = createSubagentFacade({ adapter, allowedRoles: new Set(['executor']) });
+    const spawn = parseResult(await execute({ action: 'spawn', role: 'executor', task: 'classify stale step' }));
+    writeFileSync(join(asyncDir, 'status.json'), JSON.stringify({
+      runId: asyncId,
+      mode: 'single',
+      state: 'complete',
+      startedAt: Date.now() - 1000,
+      endedAt: Date.now(),
+      lastUpdate: Date.now(),
+      pid: process.pid,
+      cwd: stateRoot,
+      steps: [{ agent: 'executor', status: 'failed', error: 'terminated' }],
+    }, null, 2));
+    writeFileSync(resultPath, JSON.stringify({
+      id: asyncId,
+      mode: 'single',
+      state: 'complete',
+      success: true,
+      exitCode: 0,
+      summary: 'revived findings delivered',
+      results: [{ agent: 'executor', success: true, output: 'revived findings delivered' }],
+    }, null, 2));
+
+    const waited = parseResult(await execute({ action: 'wait', childId: spawn.child.childId, timeoutMs: 1000 }));
+
+    assert.equal(waited.child.status, 'completed');
+    assert.equal(waited.child.failureReason, null);
+    assert.equal(waited.child.outputArtifactKind, 'findings');
+    assert.equal(waited.child.outputUsableForSynthesis, true);
+    assert.match(waited.child.childOutputPreview, /revived findings delivered/);
+  });
+});
+
+test('stronk_subagent intercom wait does not treat completion marker as synthesis output', async () => {
+  const stateRoot = mkdtempSync(join(tmpdir(), 'stronk-pi-facade-marker.'));
+  const asyncRoot = mkdtempSync(join(tmpdir(), 'stronk-pi-upstream-marker.'));
+  const asyncId = 'async-marker-run';
+  const events = new FakeEvents();
+  const { asyncDir, resultPath } = registerSimpleIntercomRun(events, { stateRoot, asyncRoot, asyncId });
+
+  await withEnv({
+    STRONK_PI_STATE_ROOT: stateRoot,
+    STRONK_PI_FACADE_RUN_ID: 'facade-marker-run',
+    STRONK_PI_SUBAGENT_ADAPTER: 'intercom',
+  }, async () => {
+    const adapter = new PiSubagentsBridgeAdapter({ events, timeoutMs: 1000 });
+    const execute = createSubagentFacade({ adapter, allowedRoles: new Set(['executor']) });
+    const spawn = parseResult(await execute({ action: 'spawn', role: 'executor', task: 'complete without content' }));
+    writeFileSync(join(asyncDir, 'status.json'), JSON.stringify({
+      runId: asyncId,
+      mode: 'single',
+      state: 'complete',
+      startedAt: Date.now() - 1000,
+      endedAt: Date.now(),
+      lastUpdate: Date.now(),
+      pid: process.pid,
+      cwd: stateRoot,
+      steps: [{ agent: 'executor', status: 'completed' }],
+    }, null, 2));
+    writeFileSync(resultPath, JSON.stringify({
+      id: asyncId,
+      mode: 'single',
+      state: 'complete',
+      success: true,
+      exitCode: 0,
+      results: [{ agent: 'executor', success: true }],
+    }, null, 2));
+
+    const waited = parseResult(await execute({ action: 'wait', childId: spawn.child.childId, timeoutMs: 1000 }));
+
+    assert.equal(waited.child.status, 'completed');
+    assert.equal(waited.child.outputArtifactKind, 'terminal-summary');
+    assert.equal(waited.child.outputUsableForSynthesis, false);
+    assert.equal(waited.child.childOutputPreview, 'subagent completed');
+  });
 });
 
 test('stronk_subagent intercom wait timeout returns non-terminal recovery metadata', async () => {

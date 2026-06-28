@@ -1,4 +1,4 @@
-const ACTIONS = new Set(['spawn', 'wait', 'wait_all', 'read_output', 'status', 'send_input', 'interrupt', 'close', 'close_all', 'revive']);
+const ACTIONS = new Set(['spawn', 'list', 'wait', 'wait_all', 'read_output', 'status', 'send_input', 'interrupt', 'close', 'close_all', 'revive']);
 const TERMINAL_ACTIONS = new Set(['wait', 'status', 'send_input', 'interrupt', 'close', 'revive']);
 export const MAX_CHILDREN = 6;
 
@@ -34,7 +34,8 @@ const COMMON_KEYS = new Set(['action']);
 const SPAWN_KEYS = new Set(['action', 'agent', 'role', 'task', 'timeoutMs']);
 const TARGET_KEYS = new Set(['action', 'childId', 'child_id', 'target', 'timeoutMs']);
 const SEND_INPUT_KEYS = new Set(['action', 'childId', 'child_id', 'target', 'message', 'timeoutMs']);
-const REVIVE_KEYS = new Set(['action', 'childId', 'child_id', 'target', 'task', 'timeoutMs']);
+const REVIVE_KEYS = new Set(['action', 'childId', 'child_id', 'target', 'task', 'message', 'timeoutMs']);
+const LIST_KEYS = new Set(['action', 'timeoutMs']);
 const BATCH_KEYS = new Set(['action', 'childIds', 'timeoutMs']);
 const READ_OUTPUT_KEYS = new Set(['action', 'outputHandle', 'offset', 'maxChars']);
 
@@ -61,6 +62,15 @@ function stringValue(value, label) {
 function optionalString(value, label) {
   if (value === undefined || value === null || value === '') return undefined;
   return stringValue(value, label);
+}
+
+function reviveTask(payload) {
+  const task = optionalString(payload.task, 'task');
+  const message = optionalString(payload.message, 'message');
+  if (task && message && task !== message) {
+    throw new FacadeSchemaError('stronk_subagent revive accepts task or message, not both');
+  }
+  return task ?? message;
 }
 
 function optionalTimeout(value) {
@@ -163,6 +173,7 @@ export function normalizeFacadePayload(payload) {
     ...REVIVE_KEYS,
     ...BATCH_KEYS,
     ...READ_OUTPUT_KEYS,
+    ...LIST_KEYS,
   ]));
 
   const action = stringValue(payload.action, 'action');
@@ -192,12 +203,20 @@ export function normalizeFacadePayload(payload) {
     };
   }
 
+  if (action === 'list') {
+    assertKnownKeys(payload, LIST_KEYS);
+    return {
+      action,
+      timeoutMs: optionalTimeout(payload.timeoutMs),
+    };
+  }
+
   if (action === 'revive') {
     assertKnownKeys(payload, REVIVE_KEYS);
     return {
       action,
       childId: childTarget(payload),
-      task: optionalString(payload.task, 'task'),
+      task: reviveTask(payload),
       timeoutMs: optionalTimeout(payload.timeoutMs),
     };
   }

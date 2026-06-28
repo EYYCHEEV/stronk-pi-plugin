@@ -77,6 +77,7 @@ const ROLE_ALIASES = new Map([
 ]);
 
 function normalizeRole(role, allowedRoles) {
+  if (allowedRoles?.has(role)) return role;
   const aliases = ROLE_ALIASES.get(role);
   if (!aliases) return role;
   if (allowedRoles) {
@@ -264,6 +265,15 @@ export function createSubagentFacade({
       assertAllowedRole(normalized.role, spawnAllowedRoles);
       const child = await adapter.spawn(ledger, normalized, runtime);
       return facadeResult('spawn', ledger, { child: ledger.publicChild(child) });
+    }
+
+    if (normalized.action === 'list') {
+      const children = (await ledger.children()).map((child) => ledger.publicChild(child));
+      await ledger.appendEvent({
+        event: 'facade_list',
+        childIds: children.map((child) => child.childId),
+      });
+      return facadeResult('list', ledger, { children });
     }
 
     if (normalized.action === 'status') {
