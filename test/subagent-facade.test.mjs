@@ -49,6 +49,14 @@ function ledgerChildrenForRun(stateRoot, runId) {
   return JSON.parse(readFileSync(ledgerArtifactsForRun(stateRoot, runId).children, 'utf8')).children;
 }
 
+function ledgerEventsForRun(stateRoot, runId) {
+  return readFileSync(ledgerArtifactsForRun(stateRoot, runId).events, 'utf8')
+    .trim()
+    .split('\n')
+    .filter(Boolean)
+    .map((line) => JSON.parse(line));
+}
+
 function assertPublicResultPathClean(result, forbiddenPaths = []) {
   const serialized = JSON.stringify(result);
   assert.equal(Object.hasOwn(result, 'artifacts'), false);
@@ -509,6 +517,12 @@ test('stronk_subagent wait_all preserves request order and exposes mixed termina
     assert.equal(batch.children[1].timedOut, true);
     assert.equal(batch.children[2].recommendedNextAction, 'close_child');
     assert.deepEqual(waitCalls.map((call) => call.childId), requested);
+    const waitAllEvent = ledgerEventsForRun(stateRoot, 'facade-wait-all-mixed-run').find((event) => event.event === 'facade_wait_all');
+    assert.deepEqual(waitAllEvent.childIds, requested);
+    assert.deepEqual(waitAllEvent.terminalChildIds, [failed.child.childId, completed.child.childId]);
+    assert.deepEqual(waitAllEvent.nonTerminalChildIds, [running.child.childId]);
+    assert.deepEqual(waitAllEvent.failedChildIds, [failed.child.childId]);
+    assert.equal(waitAllEvent.timedOut, true);
   });
 });
 
@@ -684,12 +698,20 @@ test('stronk_subagent terminal output handle is opaque and read_output returns s
     }));
     assert.equal(first.action, 'read_output');
     assert.equal(first.output.handle, waited.child.childOutputHandle);
+    assert.equal(first.output.childId, waited.child.childId);
     assert.equal(first.output.offset, 0);
     assert.equal(first.output.nextOffset, 12);
     assert.equal(first.output.eof, false);
     assert.equal(first.output.redacted, true);
     assert.match(first.output.hash, /^[a-f0-9]{64}$/);
     assert.match(first.output.chunk, /^alpha/);
+    const eventsAfterFirstRead = ledgerEventsForRun(stateRoot, 'facade-output-handle-run');
+    const readOutputEvent = eventsAfterFirstRead.find((event) => event.event === 'facade_read_output');
+    assert.equal(readOutputEvent.outputHandle, waited.child.childOutputHandle);
+    assert.equal(readOutputEvent.childId, waited.child.childId);
+    assert.equal(readOutputEvent.offset, 0);
+    assert.equal(readOutputEvent.nextOffset, 12);
+    assert.equal(readOutputEvent.eof, false);
 
     const second = parseResult(await execute({
       action: 'read_output',
@@ -964,6 +986,12 @@ test('stronk_subagent close_all preserves request order, reports per-child clean
     assert.equal(batch.children[2].childOutputHandle, null);
     assert.equal(existsSync(privateCompletedBefore.childOutputArtifactPath), false);
     assertPublicResultPathClean(batch, [stateRoot, privateCompletedBefore.childOutputArtifactPath]);
+    const closeAllEvent = ledgerEventsForRun(stateRoot, runId).find((event) => event.event === 'facade_close_all');
+    assert.deepEqual(closeAllEvent.childIds, requested);
+    assert.deepEqual(closeAllEvent.closedChildIds, [running.child.childId, completed.child.childId]);
+    assert.deepEqual(closeAllEvent.failedCloseChildIds, [failed.child.childId]);
+    assert.deepEqual(closeAllEvent.cleanupVerifiedChildIds, [running.child.childId, completed.child.childId]);
+    assert.deepEqual(closeAllEvent.cleanupFailedChildIds, [failed.child.childId]);
   });
 });
 

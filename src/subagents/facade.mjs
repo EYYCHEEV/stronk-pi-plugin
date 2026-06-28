@@ -289,12 +289,32 @@ export function createSubagentFacade({
         const child = await adapter.wait(ledger, childId, { ...normalized, childId, timeoutMs: remainingMs });
         children.push(ledger.publicChild(child));
       }
-      return facadeResult('wait_all', ledger, aggregateChildren(children, timeoutMs, Date.now() - startedAt));
+      const aggregate = aggregateChildren(children, timeoutMs, Date.now() - startedAt);
+      await ledger.appendEvent({
+        event: 'facade_wait_all',
+        childIds: normalized.childIds,
+        terminalChildIds: aggregate.terminalChildIds,
+        nonTerminalChildIds: aggregate.nonTerminalChildIds,
+        failedChildIds: aggregate.failedChildIds,
+        timedOut: aggregate.timedOut,
+        timeoutMs,
+      });
+      return facadeResult('wait_all', ledger, aggregate);
     }
 
     if (normalized.action === 'read_output') {
       const output = await ledger.readOutput(normalized.outputHandle, {
         offset: normalized.offset,
+        maxChars: normalized.maxChars,
+      });
+      await ledger.appendEvent({
+        event: 'facade_read_output',
+        outputHandle: normalized.outputHandle,
+        childId: output.childId,
+        offset: output.offset,
+        nextOffset: output.nextOffset,
+        totalChars: output.totalChars,
+        eof: output.eof,
         maxChars: normalized.maxChars,
       });
       return facadeResult('read_output', ledger, { output });
@@ -379,7 +399,18 @@ export function createSubagentFacade({
           children.push(ledger.publicChild(patched));
         }
       }
-      return facadeResult('close_all', ledger, aggregateClosedChildren(children, timeoutMs, Date.now() - startedAt));
+      const aggregate = aggregateClosedChildren(children, timeoutMs, Date.now() - startedAt);
+      await ledger.appendEvent({
+        event: 'facade_close_all',
+        childIds: normalized.childIds,
+        closedChildIds: aggregate.closedChildIds,
+        failedCloseChildIds: aggregate.failedCloseChildIds,
+        cleanupVerifiedChildIds: aggregate.cleanupVerifiedChildIds,
+        cleanupFailedChildIds: aggregate.cleanupFailedChildIds,
+        timedOut: aggregate.timedOut,
+        timeoutMs,
+      });
+      return facadeResult('close_all', ledger, aggregate);
     }
 
     if (normalized.action === 'interrupt') {

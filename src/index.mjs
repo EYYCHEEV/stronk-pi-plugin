@@ -8257,7 +8257,11 @@ function isUnsupportedMutatingTool(toolName) {
 async function handleToolCall(event, ctx = {}) {
   const toolName = event?.toolName;
   if (!toolName) return block('tool_call missing toolName');
-  if (toolName === 'subagent') return block('raw subagent tool denied; use stronk_subagent');
+  if (toolName === 'subagent') {
+    return block(
+      'raw subagent tool denied; use stronk_subagent with spawn, wait_all/status, read_output, send_input, revive, interrupt, close, or close_all',
+    );
+  }
   if (isUnsupportedMutatingTool(toolName)) return block(`unsupported mutating tool denied: ${toolName}`);
   if (DISABLED_PLUGIN_TOOLS.has(toolName)) return block(`disabled upstream tool denied: ${toolName}; use ${SAFE_FETCH_TOOL}`);
   if (hasBlockingSensitiveContent(event.input ?? {})) return block('secret literal blocked in tool_call input');
