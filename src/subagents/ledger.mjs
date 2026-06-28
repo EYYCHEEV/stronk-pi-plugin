@@ -153,7 +153,20 @@ async function withPathLock(path, action) {
   }
 }
 
+function hasOutputArtifact(child) {
+  return Boolean(child.childOutputPreview || child.childOutputHandle);
+}
+
+function outputArtifactKind(child) {
+  if (!hasOutputArtifact(child)) return 'none';
+  if (child.outputArtifactKind) return child.outputArtifactKind;
+  if (child.status === 'completed') return 'findings';
+  if (child.status === 'failed') return 'failure-summary';
+  return 'terminal-summary';
+}
+
 function publicChild(child) {
+  const artifactKind = outputArtifactKind(child);
   return {
     childId: child.childId,
     projectRef: child.projectRef ?? null,
@@ -190,7 +203,8 @@ function publicChild(child) {
     capacityBlocked: Boolean(child.capacityBlocked),
     concurrencyInUse: typeof child.concurrencyInUse === 'number' ? child.concurrencyInUse : null,
     concurrencyLimit: typeof child.concurrencyLimit === 'number' ? child.concurrencyLimit : null,
-    outputUsableForSynthesis: child.outputUsableForSynthesis ?? Boolean(child.childOutputPreview || child.childOutputHandle),
+    outputArtifactKind: artifactKind,
+    outputUsableForSynthesis: child.outputUsableForSynthesis ?? artifactKind === 'findings',
     errorSummary: child.errorSummary ?? null,
     closeError: child.closeError ? sanitizePublicOutput(child.closeError, [child.cwd]) : null,
     timedOut: Boolean(child.timedOut),
@@ -339,6 +353,7 @@ export class SubagentLedger {
         childOutputFullChars: null,
         childOutputFullHash: null,
         childOutputArtifactTruncated: false,
+        outputArtifactKind: null,
         failureReason: null,
         failureClass: null,
         retryable: false,
@@ -418,7 +433,10 @@ export class SubagentLedger {
     return join(this.outputDir, `${handle}.txt`);
   }
 
-  async storeChildOutput(childId, rawText) {
+  async storeChildOutput(childId, rawText, {
+    outputArtifactKind = null,
+    outputUsableForSynthesis = null,
+  } = {}) {
     const child = await this.getChild(childId);
     if (child.childOutputArtifactPath) {
       await removeContainedOutput(this.outputDir, child.childOutputArtifactPath).catch(() => {});
@@ -435,6 +453,8 @@ export class SubagentLedger {
       childOutputFullChars: capped.chars,
       childOutputFullHash: sha256(capped.text),
       childOutputArtifactTruncated: capped.truncated,
+      outputArtifactKind,
+      outputUsableForSynthesis,
     }, 'child_output_stored');
   }
 
@@ -450,6 +470,8 @@ export class SubagentLedger {
       childOutputFullChars: null,
       childOutputFullHash: null,
       childOutputArtifactTruncated: false,
+      outputArtifactKind: null,
+      outputUsableForSynthesis: null,
     }, 'child_output_removed');
   }
 

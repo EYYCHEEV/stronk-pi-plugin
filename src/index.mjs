@@ -8072,7 +8072,7 @@ class UnavailableSubagentAdapter {
 function subagentAdapterForPi(pi) {
   if (facadeAdapterMode() !== 'intercom') return undefined;
   if (!pi.events) {
-    return new UnavailableSubagentAdapter('pi.events is required; ensure pi-subagents and pi-intercom are loaded before the Stronk facade');
+    return new UnavailableSubagentAdapter('pi.events is required; ensure stronk-pi-subagents and pi-intercom are loaded before the Stronk facade');
   }
   return new PiSubagentsBridgeAdapter({ events: pi.events });
 }

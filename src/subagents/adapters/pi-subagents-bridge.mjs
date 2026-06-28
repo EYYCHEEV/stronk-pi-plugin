@@ -1,6 +1,6 @@
 import { createHash, randomUUID } from 'node:crypto';
 import { readFile, realpath, stat } from 'node:fs/promises';
-import { dirname, join, resolve } from 'node:path';
+import { basename, dirname, join, resolve } from 'node:path';
 import { boundedUtf8, isTerminalStatus, sanitizePublicOutput } from '../ledger.mjs';
 
 const REQUEST_EVENT = 'subagent:slash:request';
@@ -337,6 +337,12 @@ function deriveResultPath(asyncDir, runId) {
   return join(dirname(dirname(asyncDir)), 'async-subagent-results', `${runId}.json`);
 }
 
+function deriveConsumedResultPath(resultPath) {
+  if (!resultPath) return null;
+  const dir = dirname(resultPath);
+  return join(dirname(dir), `${basename(dir)}-consumed`, basename(resultPath));
+}
+
 function parentModelHint(runtime) {
   const model = runtime?.parentModel;
   return typeof model === 'string' && model.trim() ? model.trim() : undefined;
@@ -388,13 +394,35 @@ async function readStatus(child) {
 
 async function readResult(child) {
   const resultPath = child.upstreamResultPath || deriveResultPath(child.upstreamAsyncDir, child.upstreamRunId);
-  return readJson(resultPath);
+  if (!resultPath) return null;
+  return await readJson(resultPath) ?? readJson(deriveConsumedResultPath(resultPath));
+}
+
+function hasPositiveResultOutput(result) {
+  if (typeof result?.summary === 'string' && result.summary.trim()) return true;
+  if (!Array.isArray(result?.results)) return false;
+  return result.results.some((item) => (
+    typeof item?.output === 'string' && item.output.trim()
+  ) || (
+    typeof item?.finalOutput === 'string' && item.finalOutput.trim()
+  ));
+}
+
+function outputStoreOptions(kind) {
+  return {
+    outputArtifactKind: kind,
+    outputUsableForSynthesis: kind === 'findings',
+  };
 }
 
 function mapStatus(status, result, child) {
   const state = status?.state ?? result?.state;
   if (child?.status === 'closed') return 'closed';
-  if (failureReason(status, result)) return 'failed';
+  const reason = failureReason(status, result);
+  if (state === 'complete' && reason === 'upstream_step_failed' && result?.success === true && hasPositiveResultOutput(result)) {
+    return 'completed';
+  }
+  if (reason) return 'failed';
   if (state === 'complete') return 'completed';
   if (state === 'failed') return 'failed';
   if (state === 'paused') return 'interrupted';
@@ -646,7 +674,13 @@ export class PiSubagentsBridgeAdapter {
         });
         return finalChild;
       }
-      const text = resultSummary(null, immediateResult, resultText(response) || (immediateFailed ? 'subagent failed' : 'subagent completed'));
+      const responseText = resultText(response);
+      const text = resultSummary(null, immediateResult, responseText || (immediateFailed ? 'subagent failed' : 'subagent completed'));
+      const artifactKind = immediateFailed
+        ? 'failure-summary'
+        : hasPositiveResultOutput(immediateResult) || (responseText && text !== 'subagent completed')
+          ? 'findings'
+          : 'terminal-summary';
       const finalChild = await ledger.updateChild(child.childId, {
         status: immediateFailed ? 'failed' : 'completed',
         upstreamSessionId: sessionFileFromResponse(response),
@@ -661,7 +695,7 @@ export class PiSubagentsBridgeAdapter {
         recommendedNextAction: immediateFailed ? 'inspect_error' : 'close_child',
         cleanupState: 'none',
       }, immediateFailed ? 'child_failed' : 'child_completed');
-      const outputChild = await ledger.storeChildOutput(finalChild.childId, text);
+      const outputChild = await ledger.storeChildOutput(finalChild.childId, text, outputStoreOptions(artifactKind));
       await ledger.appendEvent({
         event: 'bridge_response',
         childId: child.childId,
@@ -701,7 +735,7 @@ export class PiSubagentsBridgeAdapter {
         recommendedNextAction: startTimeout ? 'run_diagnose' : 'inspect_error',
         cleanupState: 'none',
       }, 'child_failed');
-      return ledger.storeChildOutput(failedChild.childId, message);
+      return ledger.storeChildOutput(failedChild.childId, message, outputStoreOptions('failure-summary'));
     }
   }
 
@@ -759,11 +793,18 @@ export class PiSubagentsBridgeAdapter {
           result,
           nextStatus === 'interrupted' ? 'interrupted' : nextStatus === 'failed' ? 'subagent failed' : 'subagent completed',
         );
-        const outputFileSummary = fallbackSummary === 'subagent completed' || fallbackSummary === 'subagent failed' || fallbackSummary === 'interrupted'
-          ? terminalSummary(await readTrustedStatusOutput(child, status))
+        const statusOutput = fallbackSummary === 'subagent completed' || fallbackSummary === 'subagent failed' || fallbackSummary === 'interrupted'
+          ? await readTrustedStatusOutput(child, status)
           : '';
+        const outputFileSummary = statusOutput ? terminalSummary(statusOutput) : '';
         const terminalText = staleMessage || outputFileSummary || fallbackSummary;
         terminalTextForArtifact = terminalText;
+        patch.outputArtifactKind = nextStatus === 'completed' && (hasPositiveResultOutput(result) || Boolean(outputFileSummary))
+          ? 'findings'
+          : nextStatus === 'failed'
+            ? 'failure-summary'
+            : 'terminal-summary';
+        patch.outputUsableForSynthesis = patch.outputArtifactKind === 'findings';
         patch.terminalResult = nextStatus;
         Object.assign(patch, terminalMetadata(terminalText, nextStatus));
         patch.failureReason = nextStatus === 'failed' ? (reason || 'upstream_failed') : null;
@@ -792,7 +833,7 @@ export class PiSubagentsBridgeAdapter {
       status: nextStatus,
     });
     if (terminal && terminalTextForArtifact !== null) {
-      return ledger.storeChildOutput(updated.childId, terminalTextForArtifact);
+      return ledger.storeChildOutput(updated.childId, terminalTextForArtifact, outputStoreOptions(updated.outputArtifactKind || patch.outputArtifactKind));
     }
     return updated;
   }
@@ -1017,7 +1058,7 @@ export class PiSubagentsBridgeAdapter {
           recommendedNextAction: 'inspect_error',
           cleanupState: 'none',
         }, 'child_failed');
-        return ledger.storeChildOutput(failedChild.childId, text);
+        return ledger.storeChildOutput(failedChild.childId, text, outputStoreOptions('failure-summary'));
       }
       const asyncStart = bridge.asyncStarts.find((item) => item?.id === asyncId || item?.asyncId === asyncId);
       const intercomTarget = resolveSubagentIntercomTarget(asyncId, previous.role, 0);
@@ -1070,7 +1111,7 @@ export class PiSubagentsBridgeAdapter {
         recommendedNextAction: /did not start/i.test(message) ? 'run_diagnose' : 'inspect_error',
         cleanupState: 'none',
       }, 'child_failed');
-      return ledger.storeChildOutput(failedChild.childId, message);
+      return ledger.storeChildOutput(failedChild.childId, message, outputStoreOptions('failure-summary'));
     }
   }
 
