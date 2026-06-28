@@ -19,7 +19,13 @@ function withEnv(env, fn) {
   const old = {};
   for (const key of Object.keys(env)) {
     old[key] = process.env[key];
-    process.env[key] = env[key];
+    if (env[key] === undefined) {
+      // Explicitly unset so an ambient session var (e.g. STRONK_PI_SUBAGENT_FACADE) cannot
+      // leak into a test that asserts defaults. Assigning undefined is treated as delete.
+      delete process.env[key];
+    } else {
+      process.env[key] = env[key];
+    }
   }
   return Promise.resolve()
     .then(fn)
@@ -595,9 +601,11 @@ test('session_shutdown suppresses resume hint when exact resume would be unsafe 
 test('registers Stronk Pi custom tools', async () => {
   const handlers = new Map();
   const tools = [];
-  await stronkPi({
-    on: (name, handler) => handlers.set(name, handler),
-    registerTool: (tool) => tools.push(tool),
+  await withEnv({ STRONK_PI_SUBAGENT_FACADE: undefined }, async () => {
+    await stronkPi({
+      on: (name, handler) => handlers.set(name, handler),
+      registerTool: (tool) => tools.push(tool),
+    });
   });
   assert.deepEqual(tools.map((tool) => tool.name).sort(), ['code_search', 'fetch_content', 'glob', 'image_preflight_read', 'image_read', 'question', 'todoread', 'todowrite', 'web_search']);
   const byName = new Map(tools.map((tool) => [tool.name, tool]));
