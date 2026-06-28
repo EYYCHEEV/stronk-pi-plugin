@@ -1,6 +1,6 @@
 import { mkdtempSync, writeFileSync, chmodSync, readFileSync, existsSync, mkdirSync, realpathSync, rmSync, symlinkSync } from 'node:fs';
 import { createServer } from 'node:http';
-import { join } from 'node:path';
+import { dirname, join } from 'node:path';
 import { tmpdir } from 'node:os';
 import { EventEmitter } from 'node:events';
 import test from 'node:test';
@@ -328,6 +328,24 @@ function writeSkill(root, dirName, name, body = 'Skill body') {
   return skillPath;
 }
 
+function hostSkill(skillPath, name, scope = 'project') {
+  const baseDir = dirname(skillPath);
+  return {
+    name,
+    description: `${name} description`,
+    filePath: skillPath,
+    baseDir,
+    sourceInfo: {
+      path: skillPath,
+      source: 'local',
+      scope,
+      origin: 'top-level',
+      baseDir,
+    },
+    disableModelInvocation: false,
+  };
+}
+
 const PNG_BYTES = Buffer.from('89504e470d0a1a0a0000000d4948445200000001000000010802000000907753de0000000c49444154789c63606060000000040001f61738550000000049454e44ae426082', 'hex');
 const PNG_BASE64 = PNG_BYTES.toString('base64');
 const TINY_GIF_BASE64 = 'R0lGODlhAQABAPAAAP///wAAACH5BAAAAAAALAAAAAABAAEAAAICRAEAOw==';
@@ -383,7 +401,7 @@ function createAutocompleteFallbackProvider() {
   };
 }
 
-async function createSkillAutocompleteProvider(extraEnv = {}, current = createAutocompleteFallbackProvider()) {
+async function createSkillAutocompleteProvider(extraEnv = {}, current = createAutocompleteFallbackProvider(), extraCtx = {}) {
   const factories = [];
   const ui = {
     addAutocompleteProvider: (factory) => factories.push(factory),
@@ -391,7 +409,7 @@ async function createSkillAutocompleteProvider(extraEnv = {}, current = createAu
   };
 
   await withEnv(allowingPromptHookEnv(extraEnv), async () => {
-    await internals.handleSessionStart({ reason: 'startup' }, { hasUI: true, ui });
+    await internals.handleSessionStart({ reason: 'startup' }, { hasUI: true, ui, ...extraCtx });
   });
 
   assert.equal(factories.length, 1);
@@ -6179,6 +6197,118 @@ test('skill autocomplete catalog stays metadata-only', async () => {
     assert.match(suggestions.items[0].label, /^demo$/);
     assert.doesNotMatch(JSON.stringify(suggestions), /Body text that must stay hidden/);
   });
+});
+
+test('skill autocomplete uses host /skill inventory for project skills and stronkpi-agents', async () => {
+  const root = mkdtempSync(join(tmpdir(), 'stronk-pi-host-skills.'));
+  const projectPath = writeSkill(root, 'project-review', 'project-review', 'Project body that must stay hidden');
+  const agentsPath = writeSkill(root, 'stronkpi-agents', 'stronkpi-agents', 'Agent body that must stay hidden');
+  const releasePath = writeSkill(root, 'stronk-pi-release', 'stronk-pi-release', 'Release body that must stay hidden');
+  const hostSkills = [
+    hostSkill(projectPath, 'project-review', 'project'),
+    hostSkill(agentsPath, 'stronkpi-agents', 'user'),
+    hostSkill(releasePath, 'stronk-pi-release', 'project'),
+  ];
+
+  const suggestions = internals.buildSkillAutocompleteSuggestions('$', {
+    rootsJson: 'not-json',
+    hostSkills,
+  });
+  assert.ok(suggestions);
+  const labels = suggestions.items.map((item) => item.label);
+  assert.ok(labels.includes('project-review'));
+  assert.ok(labels.includes('stronkpi-agents'));
+  assert.ok(labels.includes('stronk-pi-release'));
+  assert.doesNotMatch(JSON.stringify(suggestions), /must stay hidden/);
+
+  const fuzzy = internals.buildSkillAutocompleteSuggestions('Use $stronk-pi', {
+    rootsJson: 'not-json',
+    hostSkills,
+  });
+  assert.ok(fuzzy);
+  const fuzzyLabels = fuzzy.items.map((item) => item.label);
+  assert.ok(fuzzyLabels.includes('stronkpi-agents'));
+  assert.ok(fuzzyLabels.includes('stronk-pi-release'));
+});
+
+test('skill autocomplete provider and input resolver share host /skill inventory', async () => {
+  const root = mkdtempSync(join(tmpdir(), 'stronk-pi-host-provider.'));
+  const agentsPath = writeSkill(root, 'stronkpi-agents', 'stronkpi-agents', 'Host agent body');
+  const hostSkills = [hostSkill(agentsPath, 'stronkpi-agents', 'project')];
+  const provider = await createSkillAutocompleteProvider(
+    { STRONK_PI_SKILL_ROOTS: 'not-json' },
+    createAutocompleteFallbackProvider(),
+    { getSkills: () => hostSkills },
+  );
+  const signal = new AbortController().signal;
+
+  const suggestions = await provider.getSuggestions(['Use $stronk-pi now'], 0, 'Use $stronk-pi'.length, {
+    signal,
+    force: false,
+  });
+  assert.ok(suggestions);
+  assert.deepEqual(suggestions.items.map((item) => item.value), ['$stronkpi-agents ']);
+
+  const result = await withEnv(allowingPromptHookEnv({ STRONK_PI_SKILL_ROOTS: 'not-json' }), async () => (
+    internals.handleInput({ text: 'Use $stronkpi-agents now' }, { cwd: root, getSkills: () => hostSkills })
+  ));
+  assert.equal(result.action, 'transform');
+  assert.match(result.text, /<name>stronkpi-agents<\/name>/);
+  assert.match(result.text, /Host agent body/);
+});
+
+test('skill autocomplete re-registers on same UI after reload', async () => {
+  const root = mkdtempSync(join(tmpdir(), 'stronk-pi-host-provider-reload.'));
+  const agentsPath = writeSkill(root, 'stronkpi-agents', 'stronkpi-agents', 'Host agent body');
+  const hostSkills = [hostSkill(agentsPath, 'stronkpi-agents', 'project')];
+  const factories = [];
+  const ui = {
+    addAutocompleteProvider: (factory) => factories.push(factory),
+    notify: () => {},
+  };
+  const ctx = { hasUI: true, ui, getSkills: () => hostSkills };
+
+  await withEnv(allowingPromptHookEnv({ STRONK_PI_SKILL_ROOTS: 'not-json' }), async () => {
+    await internals.handleSessionStart({ reason: 'startup' }, ctx);
+    assert.equal(factories.length, 1);
+
+    internals.handleSessionShutdown({ reason: 'reload' }, ctx, () => {});
+    await internals.handleSessionStart({ reason: 'reload' }, ctx);
+  });
+
+  assert.equal(factories.length, 2);
+  const provider = factories[1](createAutocompleteFallbackProvider());
+  const suggestions = await provider.getSuggestions(['Use $stronk-pi'], 0, 'Use $stronk-pi'.length, {
+    signal: new AbortController().signal,
+    force: false,
+  });
+  assert.ok(suggestions);
+  assert.deepEqual(suggestions.items.map((item) => item.value), ['$stronkpi-agents ']);
+});
+
+test('skill autocomplete falls back to configured roots when host /skill inventory is empty', async () => {
+  const root = mkdtempSync(join(tmpdir(), 'stronk-pi-empty-host-skills.'));
+  writeSkill(root, 'exec-plan', 'exec-plan', 'Root fallback body');
+  const roots = rootsJson([root, 'user']);
+  const provider = await createSkillAutocompleteProvider(
+    { STRONK_PI_SKILL_ROOTS: roots },
+    createAutocompleteFallbackProvider(),
+    { getSkills: () => [] },
+  );
+  const signal = new AbortController().signal;
+
+  const suggestions = await provider.getSuggestions(['Use $exec'], 0, 'Use $exec'.length, {
+    signal,
+    force: false,
+  });
+  assert.ok(suggestions);
+  assert.deepEqual(suggestions.items.map((item) => item.value), ['$exec-plan ']);
+
+  const result = await withEnv(allowingPromptHookEnv({ STRONK_PI_SKILL_ROOTS: roots }), async () => (
+    internals.handleInput({ text: 'Use $exec-plan now' }, { cwd: root, getSkills: () => [] })
+  ));
+  assert.equal(result.action, 'transform');
+  assert.match(result.text, /Root fallback body/);
 });
 
 test('skill autocomplete provider handles active $ tokens and delegates non-skill text', async () => {

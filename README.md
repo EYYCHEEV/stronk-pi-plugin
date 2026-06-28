@@ -167,7 +167,7 @@ npm run lint:security
 Prepare a plugin version bump in this repo:
 
 ```bash
-npm run version:bump -- 0.2.1
+npm run version:bump -- 0.2.2
 npm ci --ignore-scripts
 npm run check
 ```
@@ -175,7 +175,7 @@ npm run check
 After the bump PR is merged, publish the release from GitHub Actions:
 
 ```bash
-gh workflow run release.yml --ref main -f version=0.2.1
+gh workflow run release.yml --ref main -f version=0.2.2
 ```
 
 The release workflow verifies that the workflow input matches `package.json`,
