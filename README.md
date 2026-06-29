@@ -128,11 +128,13 @@ takes that name.
   Do not switch models, add fallback models, or add provider/concurrency
   overrides.
   Capacity error prose is intentionally not exposed as readable child output.
-- Terminal children may include an opaque `childOutputHandle` when the full
-  sanitized output is larger than the preview.
+- Terminal children may include an opaque `childOutputHandle` for sanitized
+  durable output.
+  Lifecycle responses do not include inline output previews.
   Use `read_output` with `outputHandle`, `offset`, and `maxChars` for bounded
   chunks.
-  Handles are not paths and are invalidated when the child is closed.
+  Handles are not paths and remain readable after close for final synthesis and
+  audit.
 - Use `close_all` for explicit batch cleanup.
   A valid batch close can still report per-child close or cleanup failures;
   inspect `failedCloseChildIds`, `cleanupFailedChildIds`, `cleanupState`,

@@ -85,7 +85,7 @@ function nowIso() {
 }
 
 function stateRoot() {
-  return resolve(process.env.STRONK_PI_STATE_ROOT || join(homedir(), '.stronk-pi'));
+  return resolve(process.env.STRONK_PI_STATE_ROOT || process.env.STRONKPI_STATE_ROOT || join(homedir(), '.stronk-pi'));
 }
 
 export function createFacadeRunId() {
@@ -495,6 +495,7 @@ export class SubagentLedger {
     return {
       handle,
       childId: child.childId,
+      artifactKind: outputArtifactKind(child),
       chunk,
       offset,
       nextOffset,

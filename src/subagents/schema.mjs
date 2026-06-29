@@ -155,9 +155,9 @@ function optionalOffset(value) {
 }
 
 function optionalMaxChars(value) {
-  if (value === undefined || value === null || value === '') return 12000;
-  if (typeof value !== 'number' || !Number.isInteger(value) || value < 1 || value > 65536) {
-    throw new FacadeSchemaError('maxChars must be an integer from 1 to 65536');
+  if (value === undefined || value === null || value === '') return 6000;
+  if (typeof value !== 'number' || !Number.isInteger(value) || value < 1 || value > 24000) {
+    throw new FacadeSchemaError('maxChars must be an integer from 1 to 24000');
   }
   return value;
 }
@@ -270,7 +270,7 @@ export const stronkSubagentSchema = {
     },
     outputHandle: { type: 'string' },
     offset: { type: 'number', minimum: 0 },
-    maxChars: { type: 'number', minimum: 1, maximum: 65536 },
+    maxChars: { type: 'number', minimum: 1, maximum: 24000 },
     child_id: { type: 'string' },
     target: { type: 'string' },
     message: { type: 'string' },

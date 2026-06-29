@@ -1,4 +1,5 @@
 import { readFileSync, readdirSync, statSync } from 'node:fs';
+import { randomUUID } from 'node:crypto';
 import { dirname, resolve } from 'node:path';
 import { normalizeFacadePayload, stronkSubagentSchema, MAX_CHILDREN } from './schema.mjs';
 import { SubagentLedger, createFacadeRunId, isTerminalStatus } from './ledger.mjs';
@@ -99,7 +100,7 @@ function resolveRoleMetadata(role, allowedRoles) {
 }
 
 function output(payload) {
-  return JSON.stringify(payload, null, 2);
+  return JSON.stringify(payload);
 }
 
 function debugArtifacts(ledger) {
@@ -116,9 +117,117 @@ function dryRunWarnings(payload = {}) {
   }];
 }
 
-function facadeResult(action, ledger, payload = {}) {
+const FACADE_SCHEMA_VERSION = 2;
+
+function compactObject(value) {
+  return Object.fromEntries(Object.entries(value).filter(([, item]) => item !== undefined));
+}
+
+function statusCounts(children = []) {
+  const counts = {};
+  for (const child of children) {
+    const status = child?.status ?? 'unknown';
+    counts[status] = (counts[status] ?? 0) + 1;
+  }
+  return counts;
+}
+
+function compactChild(child) {
+  const artifactKind = child.outputArtifactKind
+    ?? (child.childOutputHandle || child.childOutputPreview
+      ? child.status === 'completed'
+        ? 'findings'
+        : child.status === 'failed'
+          ? 'failure-summary'
+          : 'terminal-summary'
+      : undefined);
+  return compactObject({
+    childId: child.childId,
+    role: child.role,
+    roleRequested: child.roleRequested ?? child.role,
+    roleUsed: child.roleUsed ?? child.role,
+    aliasResolved: Boolean(child.aliasResolved),
+    aliasMessage: child.aliasMessage ?? null,
+    status: child.status,
+    isTerminal: isTerminalStatus(child.status),
+    previousChildId: child.previousChildId ?? null,
+    upstreamRunId: child.upstreamRunId ?? null,
+    upstreamState: child.upstreamState ?? null,
+    intercomTarget: child.intercomTarget ?? null,
+    pid: child.pid ?? null,
+    terminalResult: child.terminalResult ?? null,
+    terminalResultSha256: child.terminalResultSha256 ?? null,
+    terminalResultBytes: child.terminalResultBytes ?? 0,
+    childOutputTruncated: Boolean(child.childOutputTruncated),
+    childOutputBytes: child.childOutputBytes ?? 0,
+    childOutputHash: child.childOutputHash ?? null,
+    childOutputHandle: child.childOutputHandle ?? null,
+    childOutputFullBytes: child.childOutputFullBytes ?? null,
+    childOutputFullChars: child.childOutputFullChars ?? null,
+    childOutputFullHash: child.childOutputFullHash ?? null,
+    childOutputArtifactTruncated: Boolean(child.childOutputArtifactTruncated),
+    outputArtifactKind: artifactKind,
+    outputUsableForSynthesis: child.outputUsableForSynthesis ?? artifactKind === 'findings',
+    failureReason: child.failureReason ?? null,
+    failureClass: child.failureClass ?? null,
+    retryable: Boolean(child.retryable),
+    retryReason: child.retryReason ?? null,
+    retryAfterMs: typeof child.retryAfterMs === 'number' ? child.retryAfterMs : null,
+    capacityBlocked: Boolean(child.capacityBlocked),
+    concurrencyInUse: typeof child.concurrencyInUse === 'number' ? child.concurrencyInUse : null,
+    concurrencyLimit: typeof child.concurrencyLimit === 'number' ? child.concurrencyLimit : null,
+    errorSummary: child.errorSummary ?? null,
+    timedOut: child.timedOut ? true : undefined,
+    elapsedMs: typeof child.elapsedMs === 'number' ? child.elapsedMs : undefined,
+    timeoutMs: typeof child.timeoutMs === 'number' ? child.timeoutMs : undefined,
+    recommendedNextAction: child.recommendedNextAction ?? null,
+    closeRequested: Boolean(child.closeRequested),
+    cleanupState: child.cleanupState && child.cleanupState !== 'none' ? child.cleanupState : undefined,
+    processLive: child.processLive ?? null,
+    cleanupVerified: Boolean(child.cleanupVerified),
+    closeError: child.closeError ?? null,
+    inputAccepted: Boolean(child.inputAccepted),
+    inputLinkedChildId: child.inputLinkedChildId ?? null,
+  });
+}
+
+function ledgerPointer(ledger, children = []) {
+  const diagnostics = ledger.publicDiagnostics();
+  const handles = children
+    .map((child) => child.childOutputHandle)
+    .filter((handle) => typeof handle === 'string' && handle);
+  return compactObject({
+    facadeRunId: diagnostics.facadeRunId,
+    projectRef: diagnostics.projectRef,
+    childOutputHandle: handles.length === 1 ? handles[0] : undefined,
+    childOutputHandles: handles.length > 1 ? Object.fromEntries(children
+      .filter((child) => typeof child.childOutputHandle === 'string' && child.childOutputHandle)
+      .map((child) => [child.childId, child.childOutputHandle])) : undefined,
+  });
+}
+
+function lifecycleEnvelope(action, ledger, payload = {}, children = []) {
+  const childIds = payload.childIds ?? children.map((child) => child.childId).filter(Boolean);
+  const counts = payload.counts ?? statusCounts(children);
+  const status = payload.status
+    ?? (children.length === 0 ? 'ok' : children.every((child) => isTerminalStatus(child.status)) ? 'terminal' : 'active');
+  return compactObject({
+    ok: true,
+    action,
+    requestId: `sp-request-${randomUUID()}`,
+    schemaVersion: FACADE_SCHEMA_VERSION,
+    facadeRunId: ledger.publicDiagnostics().facadeRunId,
+    status,
+    counts,
+    childIds,
+    ledger: ledgerPointer(ledger, children),
+    ...payload,
+  });
+}
+
+function facadeResult(action, ledger, payload = {}, children = []) {
   const warnings = dryRunWarnings(payload);
-  const details = { ok: true, action, ...payload };
+  const details = lifecycleEnvelope(action, ledger, payload, children);
   if (warnings.length > 0) details.warnings = warnings;
   Object.assign(details, debugArtifacts(ledger));
   return {
@@ -263,29 +372,33 @@ export function createSubagentFacade({
       const roleMetadata = resolveRoleMetadata(normalized.role, spawnAllowedRoles);
       Object.assign(normalized, roleMetadata, { role: roleMetadata.roleUsed });
       assertAllowedRole(normalized.role, spawnAllowedRoles);
-      const child = await adapter.spawn(ledger, normalized, runtime);
-      return facadeResult('spawn', ledger, { child: ledger.publicChild(child) });
+      const child = compactChild(ledger.publicChild(await adapter.spawn(ledger, normalized, runtime)));
+      return facadeResult('spawn', ledger, { child }, [child]);
     }
 
     if (normalized.action === 'list') {
-      const children = (await ledger.children()).map((child) => ledger.publicChild(child));
+      const children = (await ledger.children()).map((child) => compactChild(ledger.publicChild(child)));
       await ledger.appendEvent({
         event: 'facade_list',
         childIds: children.map((child) => child.childId),
       });
-      return facadeResult('list', ledger, { children });
+      return facadeResult('list', ledger, {
+        statusByChildId: Object.fromEntries(children.map((child) => [child.childId, child.status])),
+      }, children);
     }
 
     if (normalized.action === 'status') {
       const child = typeof adapter.status === 'function'
         ? await adapter.status(ledger, normalized.childId, normalized)
         : await ledger.getChild(normalized.childId);
-      return facadeResult('status', ledger, { child: ledger.publicChild(child) });
+      const publicChild = compactChild(ledger.publicChild(child));
+      return facadeResult('status', ledger, { child: publicChild }, [publicChild]);
     }
 
     if (normalized.action === 'wait') {
       const child = await adapter.wait(ledger, normalized.childId, normalized);
-      return facadeResult('wait', ledger, { child: ledger.publicChild(child) });
+      const publicChild = compactChild(ledger.publicChild(child));
+      return facadeResult('wait', ledger, { child: publicChild }, [publicChild]);
     }
 
     if (normalized.action === 'wait_all') {
@@ -297,7 +410,7 @@ export function createSubagentFacade({
       for (const childId of normalized.childIds) {
         const remainingMs = Math.max(1, deadline - Date.now());
         const child = await adapter.wait(ledger, childId, { ...normalized, childId, timeoutMs: remainingMs });
-        children.push(ledger.publicChild(child));
+        children.push(compactChild(ledger.publicChild(child)));
       }
       const aggregate = aggregateChildren(children, timeoutMs, Date.now() - startedAt);
       await ledger.appendEvent({
@@ -309,7 +422,11 @@ export function createSubagentFacade({
         timedOut: aggregate.timedOut,
         timeoutMs,
       });
-      return facadeResult('wait_all', ledger, aggregate);
+      const { children: _children, ...compactAggregate } = aggregate;
+      return facadeResult('wait_all', ledger, {
+        ...compactAggregate,
+        statusByChildId: Object.fromEntries(children.map((child) => [child.childId, child.status])),
+      }, children);
     }
 
     if (normalized.action === 'read_output') {
@@ -327,7 +444,7 @@ export function createSubagentFacade({
         eof: output.eof,
         maxChars: normalized.maxChars,
       });
-      return facadeResult('read_output', ledger, { output });
+      return facadeResult('read_output', ledger, { output }, [{ childId: output.childId, status: 'read', childOutputHandle: output.handle }]);
     }
 
     if (normalized.action === 'send_input') {
@@ -345,8 +462,8 @@ export function createSubagentFacade({
         throw new Error('stronk_subagent send_input denied: child is terminal or has no registered intercom target');
       }
       if (typeof adapter.sendInput === 'function') {
-        const updated = await adapter.sendInput(ledger, normalized.childId, normalized, runtime);
-        return facadeResult('send_input', ledger, { child: ledger.publicChild(updated) });
+        const updated = compactChild(ledger.publicChild(await adapter.sendInput(ledger, normalized.childId, normalized, runtime)));
+        return facadeResult('send_input', ledger, { child: updated }, [updated]);
       }
       await ledger.appendEvent({
         event: 'send_input_denied',
@@ -364,8 +481,8 @@ export function createSubagentFacade({
         throw new Error('stronk_subagent revive denied: child is not terminal');
       }
       if (typeof adapter.revive === 'function') {
-        const revived = await adapter.revive(ledger, previous.childId, normalized, runtime);
-        return facadeResult('revive', ledger, { previousChildId: previous.childId, child: ledger.publicChild(revived) });
+        const revived = compactChild(ledger.publicChild(await adapter.revive(ledger, previous.childId, normalized, runtime)));
+        return facadeResult('revive', ledger, { previousChildId: previous.childId, child: revived }, [revived]);
       }
       const revived = await adapter.spawn(ledger, {
         action: 'spawn',
@@ -378,12 +495,14 @@ export function createSubagentFacade({
         task: normalized.task || `revive:${previous.childId}`,
         previousChildId: previous.childId,
       }, runtime);
-      return facadeResult('revive', ledger, { previousChildId: previous.childId, child: ledger.publicChild(revived) });
+      const publicChild = compactChild(ledger.publicChild(revived));
+      return facadeResult('revive', ledger, { previousChildId: previous.childId, child: publicChild }, [publicChild]);
     }
 
     if (normalized.action === 'close') {
       const child = await adapter.close(ledger, normalized.childId, normalized);
-      return facadeResult('close', ledger, { child: ledger.publicChild(child) });
+      const publicChild = compactChild(ledger.publicChild(child));
+      return facadeResult('close', ledger, { child: publicChild }, [publicChild]);
     }
 
     if (normalized.action === 'close_all') {
@@ -396,8 +515,7 @@ export function createSubagentFacade({
         const remainingMs = Math.max(1, deadline - Date.now());
         try {
           const closed = await adapter.close(ledger, childId, { ...normalized, childId, timeoutMs: remainingMs });
-          const cleared = await ledger.clearChildOutput(closed.childId);
-          children.push(ledger.publicChild(cleared));
+          children.push(compactChild(ledger.publicChild(closed)));
         } catch (error) {
           const message = error instanceof Error ? error.message : String(error);
           const current = await ledger.getChild(childId);
@@ -406,7 +524,7 @@ export function createSubagentFacade({
             cleanupState: current.cleanupState === 'none' ? 'close_failed' : current.cleanupState,
             cleanupVerified: false,
           }, 'child_close_failed_visible');
-          children.push(ledger.publicChild(patched));
+          children.push(compactChild(ledger.publicChild(patched)));
         }
       }
       const aggregate = aggregateClosedChildren(children, timeoutMs, Date.now() - startedAt);
@@ -420,12 +538,17 @@ export function createSubagentFacade({
         timedOut: aggregate.timedOut,
         timeoutMs,
       });
-      return facadeResult('close_all', ledger, aggregate);
+      const { children: _children, ...compactAggregate } = aggregate;
+      return facadeResult('close_all', ledger, {
+        ...compactAggregate,
+        statusByChildId: Object.fromEntries(children.map((child) => [child.childId, child.status])),
+      }, children);
     }
 
     if (normalized.action === 'interrupt') {
       const child = await adapter.interrupt(ledger, normalized.childId, normalized);
-      return facadeResult('interrupt', ledger, { child: ledger.publicChild(child) });
+      const publicChild = compactChild(ledger.publicChild(child));
+      return facadeResult('interrupt', ledger, { child: publicChild }, [publicChild]);
     }
 
     throw new Error(`stronk_subagent action denied: ${normalized.action}`);

@@ -13,7 +13,7 @@ const packageJson = JSON.parse(readFileSync(join(packageRoot, 'package.json'), '
 const pluginVersion = process.env.STRONK_PI_SMOKE_PLUGIN_VERSION || packageJson.version;
 
 const home = homedir();
-const stateRoot = process.env.STRONK_PI_STATE_ROOT || join(home, '.stronk-pi');
+const stateRoot = process.env.STRONK_PI_STATE_ROOT || process.env.STRONKPI_STATE_ROOT || join(home, '.stronk-pi');
 const runtimeRoot = process.env.STRONK_PI_SMOKE_RUNTIME || join(stateRoot, 'pi-fork-runtime');
 const pluginPath = process.env.STRONK_PI_SMOKE_PLUGIN
   || join(stateRoot, `artifacts/stronk-pi-plugin-${pluginVersion}/package/src/index.mjs`);
@@ -81,6 +81,11 @@ function parseToolJson(result) {
 function assertNoDryRunPath(payload) {
   const serialized = JSON.stringify(payload);
   assert.doesNotMatch(serialized, /dry-run|dry_run_no_worker|skipped child execution/i);
+}
+
+function assertNoInlineOutputPreview(child) {
+  assert.equal(Object.hasOwn(child, 'childOutputPreview'), false);
+  assert.equal(Object.hasOwn(child, 'terminalOutputPreview'), false);
 }
 
 function assertPublicPathClean(payload, forbidden = []) {
@@ -310,13 +315,10 @@ try {
     assertPublicPathClean(waited, [subagentStateRoot, packageRoot]);
     assert.equal(waited.child.status, 'completed');
     assert.equal(waited.child.isTerminal, true);
-    assert.match(waited.child.childOutputPreview, /installed artifact intercom child completed/);
+    assertNoInlineOutputPreview(waited.child);
     assert.equal(waited.child.childOutputTruncated, true);
-    assert.equal(waited.child.childOutputBytes, Buffer.byteLength(waited.child.childOutputPreview, 'utf8'));
     assert.match(waited.child.childOutputHash, /^[a-f0-9]{64}$/);
     assert.match(waited.child.childOutputHandle, /^subagent-output-[a-f0-9-]+$/);
-    assert.doesNotMatch(waited.child.childOutputPreview, /supersecret123/);
-    assert.doesNotMatch(waited.child.childOutputPreview, new RegExp(subagentStateRoot.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')));
     assert.equal(waited.child.recommendedNextAction, 'close_child');
 
     const read = parseToolJson(await facade.execute({
@@ -346,7 +348,8 @@ try {
     }));
     assertNoDryRunPath(batch);
     assertPublicPathClean(batch, [subagentStateRoot, packageRoot]);
-    assert.equal(batch.children.length, 3);
+    assert.equal(Object.hasOwn(batch, 'children'), false);
+    assert.deepEqual(batch.childIds, [spawn.child.childId, running.child.childId, failed.child.childId]);
     assert.equal(batch.timedOut, true);
     assert.deepEqual(batch.nonTerminalChildIds, [running.child.childId]);
     assert.deepEqual(batch.failedChildIds, [failed.child.childId]);
@@ -358,12 +361,19 @@ try {
     }));
     assertNoDryRunPath(closed);
     assertPublicPathClean(closed, [subagentStateRoot, packageRoot]);
-    assert.equal(closed.children.length, 4);
+    assert.equal(Object.hasOwn(closed, 'children'), false);
+    assert.deepEqual(closed.childIds, [spawn.child.childId, running.child.childId, failed.child.childId, closeFail.child.childId]);
     assert.ok(closed.closedChildIds.includes(spawn.child.childId));
-    assert.ok(closed.cleanupVerifiedChildIds.includes(running.child.childId) || closed.children.find((child) => child.childId === running.child.childId)?.cleanupVerified === false);
+    assert.ok(closed.cleanupVerifiedChildIds.includes(running.child.childId));
     assert.deepEqual(closed.failedCloseChildIds, [closeFail.child.childId]);
-    assert.equal(closed.children.find((child) => child.childId === closeFail.child.childId)?.closeError, 'stronk_subagent close failed: simulated installed close failure');
-    assert.equal(closed.children.find((child) => child.childId === spawn.child.childId)?.childOutputHandle, null);
+    assert.deepEqual(closed.cleanupFailedChildIds, [closeFail.child.childId]);
+    const postCloseRead = parseToolJson(await facade.execute({
+      action: 'read_output',
+      outputHandle: waited.child.childOutputHandle,
+      offset: 0,
+      maxChars: 512,
+    }));
+    assert.match(postCloseRead.output.chunk, /installed artifact intercom child completed/);
 
     const capacity = parseToolJson(await facade.execute({
       action: 'spawn',
@@ -380,7 +390,7 @@ try {
     assert.equal(capacity.child.concurrencyLimit, 6);
     assert.equal(capacity.child.outputUsableForSynthesis, false);
     assert.equal(capacity.child.childOutputHandle, null);
-    assert.equal(capacity.child.childOutputPreview, null);
+    assertNoInlineOutputPreview(capacity.child);
     assert.equal(capacity.child.recommendedNextAction, 'retry_capacity_children_next_batch');
     assert.doesNotMatch(JSON.stringify(capacity), /concurrent limit reached|slots in use/i);
 
@@ -408,7 +418,8 @@ try {
     }));
     assertNoDryRunPath(capacityClosed);
     assertPublicPathClean(capacityClosed, [subagentStateRoot, packageRoot]);
-    assert.equal(capacityClosed.children.length, 2);
+    assert.equal(Object.hasOwn(capacityClosed, 'children'), false);
+    assert.deepEqual(capacityClosed.childIds, [capacity.child.childId, revivedCapacity.child.childId]);
     assert.equal(capacityClosed.failedCloseChildIds.length, 0);
   });
 } finally {
@@ -712,7 +723,7 @@ if (runInstalledAgentSmoke) {
       'If the child result indicates a mocked worker, skipped child execution, or no launched worker, stop and report failure.',
       '',
       '1. Spawn three role `executor` children with tasks that do not modify files.',
-      '   Child A must return a long output containing the token below, plus a fake local path `/tmp/stronk-pi-should-redact`, plus `password=supersecret123`, plus enough filler text that the preview is truncated and a `childOutputHandle` is produced.',
+      '   Child A must return a long output containing the token below, plus a fake local path `/tmp/stronk-pi-should-redact`, plus `password=supersecret123`, plus enough filler text that a `childOutputHandle` is produced.',
       '   Child B must stay non-terminal for at least 30 seconds before returning exactly `STATUS_TOKEN=STRONK_PI_WAIT_ALL_RUNNING_CHILD_DONE`.',
       '   Child C must visibly report a failure or failed finding without modifying files.',
       '',
@@ -721,9 +732,9 @@ if (runInstalledAgentSmoke) {
       '```',
       '',
       '2. Call `wait_all` with all three child IDs and `timeoutMs=1000` before Child B finishes.',
-      '3. Confirm the parent-visible batch result has exactly three children in request order, no `cwd`, no raw local paths, no debug artifact paths, failure visibility for Child C, and one non-terminal timeout entry for Child B.',
+      '3. Confirm the parent-visible batch result has exactly three `childIds` in request order, no public `children` array, no `cwd`, no raw local paths, no debug artifact paths, failure visibility for Child C, and one non-terminal timeout entry for Child B.',
       '4. Use `read_output` on Child A `childOutputHandle` with chunking. Confirm the handle is opaque, output is redacted, and no raw output path is visible.',
-      '5. Call `close_all` on all three child IDs and confirm per-child cleanup fields are present. Confirm close failure arrays are visible in the schema, even if all real closes succeed.',
+      '5. Call `close_all` on all three child IDs and confirm aggregate cleanup arrays are present. Confirm close failure arrays are visible in the schema, even if all real closes succeed.',
       '6. Run negative checks through `stronk_subagent`: duplicate child ID in `wait_all` must be denied, a foreign child ID must be denied, and an invalid output handle must be denied.',
       '7. Recheck any file-line citations in the final answer against current files if you cite a file.',
       '8. Final answer must include exactly these lines:',

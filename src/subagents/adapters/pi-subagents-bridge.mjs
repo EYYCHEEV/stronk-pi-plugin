@@ -1145,7 +1145,7 @@ export class PiSubagentsBridgeAdapter {
         processLive,
         cleanupVerified: cleanupVerifiedFromProcess(processLive),
       }, 'child_already_closed');
-      return ledger.clearChildOutput(updated.childId);
+      return updated;
     }
     let requestId = null;
     try {
@@ -1169,7 +1169,7 @@ export class PiSubagentsBridgeAdapter {
             processLive,
             cleanupVerified: cleanupVerifiedFromProcess(processLive),
           }, 'child_already_closed');
-          return ledger.clearChildOutput(updated.childId);
+          return updated;
         }
       }
       await ledger.appendEvent({ event: 'bridge_close_error', childId, upstreamRunId: child.upstreamRunId, ...errorMetadata(message, 'bridge_close_error') });
@@ -1191,7 +1191,7 @@ export class PiSubagentsBridgeAdapter {
       recommendedNextAction: null,
       ...terminalMetadata('closed', 'closed'),
     }, 'child_closed');
-    return ledger.clearChildOutput(closed.childId);
+    return closed;
   }
 
   async interrupt(ledger, childId, normalized = {}) {

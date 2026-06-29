@@ -2681,6 +2681,32 @@ test('image preflight config reads the portable Stronk Pi config contract', () =
   assert.equal(config.failureMode, 'block');
 });
 
+test('image preflight config honors STRONKPI_STATE_ROOT when canonical state root is absent', () => {
+  const home = mkdtempSync(join(tmpdir(), 'stronk-pi-image-config-legacy-home.'));
+  const legacyRoot = join(home, 'legacy-state');
+  const defaultRoot = join(home, '.stronk-pi');
+  mkdirSync(join(legacyRoot, 'config'), { recursive: true });
+  mkdirSync(join(defaultRoot, 'config'), { recursive: true });
+  writeFileSync(join(legacyRoot, 'config', 'defaults.toml'), [
+    '[image_preflight]',
+    'model = "legacy/vision-model:xhigh"',
+    'max_images = 3',
+    '',
+  ].join('\n'));
+  writeFileSync(join(defaultRoot, 'config', 'defaults.toml'), [
+    '[image_preflight]',
+    'model = "wrong/default-root"',
+    'max_images = 9',
+    '',
+  ].join('\n'));
+
+  const config = internals.resolveVisionPreflightConfig({ env: { HOME: home, STRONKPI_STATE_ROOT: legacyRoot } });
+
+  assert.equal(config.stateRoot, legacyRoot);
+  assert.equal(config.model, 'legacy/vision-model:xhigh');
+  assert.equal(config.maxImages, 3);
+});
+
 test('image preflight image count defaults and clamps at twelve', () => {
   assert.equal(
     internals.resolveVisionPreflightConfig({ defaultsToml: '[image_preflight]\n' }).maxImages,
