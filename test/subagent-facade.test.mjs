@@ -29,6 +29,28 @@ function parseResult(result) {
   return JSON.parse(result.text);
 }
 
+function assertNoInlineOutputPreview(child) {
+  assert.equal(Object.hasOwn(child, 'childOutputPreview'), false);
+  assert.equal(Object.hasOwn(child, 'terminalOutputPreview'), false);
+}
+
+async function readAllOutput(execute, handle, maxChars = 24000) {
+  let offset = 0;
+  let text = '';
+  let last;
+  do {
+    last = parseResult(await execute({
+      action: 'read_output',
+      outputHandle: handle,
+      offset,
+      maxChars,
+    }));
+    text += last.output.chunk;
+    offset = last.output.nextOffset;
+  } while (!last.output.eof);
+  return { text, last };
+}
+
 function mode(path) {
   return statSync(path).mode & 0o777;
 }
@@ -400,8 +422,12 @@ test('stronk_subagent public batch wait results omit cwd and debug artifact path
     }));
     const artifacts = ledgerArtifactsForRun(stateRoot, runId);
 
-    assert.equal(batch.children.length, 2);
-    assert.deepEqual(batch.children.map((child) => child.childId), [first.child.childId, second.child.childId]);
+    assert.equal(Object.hasOwn(batch, 'children'), false);
+    assert.deepEqual(batch.childIds, [first.child.childId, second.child.childId]);
+    assert.deepEqual(batch.statusByChildId, {
+      [first.child.childId]: 'dry-run',
+      [second.child.childId]: 'dry-run',
+    });
     assertPublicResultPathClean(batch, [stateRoot, artifacts.runDir, artifacts.children, artifacts.events]);
   });
 });
@@ -505,7 +531,8 @@ test('stronk_subagent wait_all preserves request order and exposes mixed termina
     const batch = parseResult(await execute({ action: 'wait_all', childIds: requested, timeoutMs: 1000 }));
 
     assert.equal(batch.action, 'wait_all');
-    assert.deepEqual(batch.children.map((child) => child.childId), requested);
+    assert.equal(Object.hasOwn(batch, 'children'), false);
+    assert.deepEqual(batch.childIds, requested);
     assert.deepEqual(batch.terminalChildIds, [failed.child.childId, completed.child.childId]);
     assert.deepEqual(batch.nonTerminalChildIds, [running.child.childId]);
     assert.deepEqual(batch.failedChildIds, [failed.child.childId]);
@@ -513,9 +540,16 @@ test('stronk_subagent wait_all preserves request order and exposes mixed termina
     assert.equal(batch.timeoutMs, 1000);
     assert.equal(typeof batch.elapsedMs, 'number');
     assert.equal(batch.recommendedNextAction, 'wait_again');
-    assert.equal(batch.children[0].failureReason, 'test_failure');
-    assert.equal(batch.children[1].timedOut, true);
-    assert.equal(batch.children[2].recommendedNextAction, 'close_child');
+    assert.deepEqual(batch.statusByChildId, {
+      [failed.child.childId]: 'failed',
+      [running.child.childId]: 'running',
+      [completed.child.childId]: 'completed',
+    });
+    const privateChildren = ledgerChildrenForRun(stateRoot, 'facade-wait-all-mixed-run');
+    const privateById = new Map(privateChildren.map((child) => [child.childId, child]));
+    assert.equal(privateById.get(failed.child.childId).failureReason, 'test_failure');
+    assert.equal(privateById.get(running.child.childId).timedOut, true);
+    assert.equal(privateById.get(completed.child.childId).recommendedNextAction, 'close_child');
     assert.deepEqual(waitCalls.map((call) => call.childId), requested);
     const waitAllEvent = ledgerEventsForRun(stateRoot, 'facade-wait-all-mixed-run').find((event) => event.event === 'facade_wait_all');
     assert.deepEqual(waitAllEvent.childIds, requested);
@@ -583,14 +617,17 @@ test('stronk_subagent wait_all exposes drain-aware retry metadata for provider c
     const requested = [capacity.child.childId, running.child.childId, completed.child.childId];
 
     const draining = parseResult(await execute({ action: 'wait_all', childIds: requested, timeoutMs: 1000 }));
-    assert.deepEqual(draining.children.map((child) => child.childId), requested);
+    assert.equal(Object.hasOwn(draining, 'children'), false);
+    assert.deepEqual(draining.childIds, requested);
     assert.deepEqual(draining.retryableCapacityChildIds, [capacity.child.childId]);
     assert.equal(draining.retryPolicy, 'after_nonterminal_drain');
     assert.equal(draining.nextRetryAfterMs, null);
     assert.equal(draining.recommendedNextAction, 'wait_again');
-    assert.equal(draining.children[0].failureClass, 'provider_capacity');
-    assert.equal(draining.children[0].retryable, true);
-    assert.equal(draining.children[0].outputUsableForSynthesis, false);
+    const privateChildren = ledgerChildrenForRun(stateRoot, 'facade-wait-all-capacity-run');
+    const capacityChild = privateChildren.find((child) => child.childId === capacity.child.childId);
+    assert.equal(capacityChild.failureClass, 'provider_capacity');
+    assert.equal(capacityChild.retryable, true);
+    assert.equal(capacityChild.outputUsableForSynthesis, false);
 
     adapter.drained = true;
     const drained = parseResult(await execute({ action: 'wait_all', childIds: requested, timeoutMs: 1000 }));
@@ -717,7 +754,7 @@ test('stronk_subagent terminal output handle is opaque and read_output returns s
       action: 'read_output',
       outputHandle: waited.child.childOutputHandle,
       offset: first.output.nextOffset,
-      maxChars: 65536,
+      maxChars: 24000,
     }));
     const combined = `${first.output.chunk}${second.output.chunk}`;
     assert.match(combined, /alpha/);
@@ -727,6 +764,60 @@ test('stronk_subagent terminal output handle is opaque and read_output returns s
     assert.doesNotMatch(combined, new RegExp(stateRoot.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')));
     assertPublicResultPathClean(first, [stateRoot, asyncRoot]);
     assertPublicResultPathClean(second, [stateRoot, asyncRoot]);
+  });
+});
+
+test('stronk_subagent compact lifecycle JSON stays under the default byte budget', async () => {
+  const stateRoot = mkdtempSync(join(tmpdir(), 'stronk-pi-facade-budget.'));
+  const asyncRoot = mkdtempSync(join(tmpdir(), 'stronk-pi-upstream-budget.'));
+  const asyncId = 'async-budget-run';
+  const events = new FakeEvents();
+  const { asyncDir, resultPath } = registerSimpleIntercomRun(events, { stateRoot, asyncRoot, asyncId });
+
+  await withEnv({
+    STRONK_PI_STATE_ROOT: stateRoot,
+    STRONK_PI_FACADE_RUN_ID: 'facade-budget-run',
+    STRONK_PI_SUBAGENT_ADAPTER: 'intercom',
+  }, async () => {
+    const adapter = new PiSubagentsBridgeAdapter({ events, timeoutMs: 1000 });
+    const execute = createSubagentFacade({ adapter, allowedRoles: new Set(['executor']) });
+    const spawnResult = await execute({ action: 'spawn', role: 'executor', task: 'produce bounded JSON' });
+    const spawn = parseResult(spawnResult);
+    writeFileSync(join(asyncDir, 'status.json'), JSON.stringify({
+      runId: asyncId,
+      mode: 'single',
+      state: 'complete',
+      startedAt: Date.now() - 1000,
+      endedAt: Date.now(),
+      lastUpdate: Date.now(),
+      pid: process.pid,
+      cwd: stateRoot,
+      steps: [{ agent: 'executor', status: 'complete', exitCode: 0 }],
+    }, null, 2));
+    const outputText = 'budgeted finding '.repeat(200);
+    writeFileSync(resultPath, JSON.stringify({
+      id: asyncId,
+      mode: 'single',
+      state: 'complete',
+      success: true,
+      summary: outputText,
+      results: [{ agent: 'executor', output: outputText, success: true }],
+      exitCode: 0,
+    }, null, 2));
+
+    const waitResult = await execute({ action: 'wait', childId: spawn.child.childId, timeoutMs: 1000 });
+    const waited = parseResult(waitResult);
+    const readResult = await execute({
+      action: 'read_output',
+      outputHandle: waited.child.childOutputHandle,
+      maxChars: 512,
+    });
+
+    for (const result of [spawnResult, waitResult, readResult]) {
+      assert.equal(Buffer.byteLength(result.text, 'utf8') <= 2048, true);
+      assert.equal(Buffer.byteLength(result.text, 'utf8') <= 4096, true);
+    }
+    assertNoInlineOutputPreview(waited.child);
   });
 });
 
@@ -784,11 +875,11 @@ test('stronk_subagent read_output denies invalid handles and invalid chunk bound
     await assert.rejects(() => execute({ action: 'read_output', outputHandle: handle, offset: 0.5 }), /offset/);
     await assert.rejects(() => execute({ action: 'read_output', outputHandle: handle, offset: 9999 }), /offset/);
     await assert.rejects(() => execute({ action: 'read_output', outputHandle: handle, maxChars: 0 }), /maxChars/);
-    await assert.rejects(() => execute({ action: 'read_output', outputHandle: handle, maxChars: 65537 }), /maxChars/);
+    await assert.rejects(() => execute({ action: 'read_output', outputHandle: handle, maxChars: 24001 }), /maxChars/);
   });
 });
 
-test('stronk_subagent durable output is capped at 1 MiB, UTF-8 safe, and invalidated on close', async () => {
+test('stronk_subagent durable output is capped at 1 MiB, UTF-8 safe, and remains readable after close', async () => {
   const stateRoot = mkdtempSync(join(tmpdir(), 'stronk-pi-facade-output-cap.'));
   const asyncRoot = mkdtempSync(join(tmpdir(), 'stronk-pi-upstream-output-cap.'));
   const asyncId = 'async-output-cap-run';
@@ -845,12 +936,15 @@ test('stronk_subagent durable output is capped at 1 MiB, UTF-8 safe, and invalid
     assert.equal(eof.output.eof, true);
 
     const closed = parseResult(await execute({ action: 'close', childId: spawn.child.childId, timeoutMs: 1000 }));
-    assert.equal(closed.child.childOutputHandle, null);
-    assert.equal(existsSync(privateChild.childOutputArtifactPath), false);
-    await assert.rejects(
-      () => execute({ action: 'read_output', outputHandle: waited.child.childOutputHandle }),
-      /output handle denied/,
-    );
+    assert.equal(closed.child.childOutputHandle, waited.child.childOutputHandle);
+    assert.equal(existsSync(privateChild.childOutputArtifactPath), true);
+    const postClose = parseResult(await execute({
+      action: 'read_output',
+      outputHandle: waited.child.childOutputHandle,
+      maxChars: 10,
+    }));
+    assert.equal(postClose.output.handle, waited.child.childOutputHandle);
+    assert.equal(postClose.output.eof, false);
   });
 });
 
@@ -970,7 +1064,8 @@ test('stronk_subagent close_all preserves request order, reports per-child clean
     const batch = parseResult(await execute({ action: 'close_all', childIds: requested, timeoutMs: 1000 }));
 
     assert.equal(batch.action, 'close_all');
-    assert.deepEqual(batch.children.map((child) => child.childId), requested);
+    assert.equal(Object.hasOwn(batch, 'children'), false);
+    assert.deepEqual(batch.childIds, requested);
     assert.deepEqual(batch.closedChildIds, [running.child.childId, completed.child.childId]);
     assert.deepEqual(batch.failedCloseChildIds, [failed.child.childId]);
     assert.deepEqual(batch.cleanupVerifiedChildIds, [running.child.childId, completed.child.childId]);
@@ -978,13 +1073,20 @@ test('stronk_subagent close_all preserves request order, reports per-child clean
     assert.equal(batch.timedOut, false);
     assert.equal(batch.timeoutMs, 1000);
     assert.equal(batch.recommendedNextAction, 'inspect_error');
-    assert.equal(batch.children[0].cleanupState, 'closed');
-    assert.equal(batch.children[0].cleanupVerified, true);
-    assert.equal(batch.children[1].cleanupState, 'close_failed');
-    assert.equal(batch.children[1].closeError, 'simulated close failure');
-    assert.equal(batch.children[2].cleanupState, 'already_closed');
-    assert.equal(batch.children[2].childOutputHandle, null);
-    assert.equal(existsSync(privateCompletedBefore.childOutputArtifactPath), false);
+    assert.deepEqual(batch.statusByChildId, {
+      [running.child.childId]: 'closed',
+      [failed.child.childId]: 'running',
+      [completed.child.childId]: 'completed',
+    });
+    const privateChildren = ledgerChildrenForRun(stateRoot, runId);
+    const privateById = new Map(privateChildren.map((child) => [child.childId, child]));
+    assert.equal(privateById.get(running.child.childId).cleanupState, 'closed');
+    assert.equal(privateById.get(running.child.childId).cleanupVerified, true);
+    assert.equal(privateById.get(failed.child.childId).cleanupState, 'close_failed');
+    assert.equal(privateById.get(failed.child.childId).closeError, 'simulated close failure');
+    assert.equal(privateById.get(completed.child.childId).cleanupState, 'already_closed');
+    assert.equal(privateById.get(completed.child.childId).childOutputHandle, completed.child.childOutputHandle);
+    assert.equal(existsSync(privateCompletedBefore.childOutputArtifactPath), true);
     assertPublicResultPathClean(batch, [stateRoot, privateCompletedBefore.childOutputArtifactPath]);
     const closeAllEvent = ledgerEventsForRun(stateRoot, runId).find((event) => event.event === 'facade_close_all');
     assert.deepEqual(closeAllEvent.childIds, requested);
@@ -1280,8 +1382,14 @@ test('stronk_subagent list returns current-run children without childId tracking
     const listed = parseResult(await execute({ action: 'list' }));
 
     assert.equal(listed.action, 'list');
-    assert.deepEqual(listed.children.map((child) => child.childId), [first.child.childId, second.child.childId]);
-    assert.deepEqual(listed.children.map((child) => child.role), ['executor', 'technical-researcher']);
+    assert.equal(Object.hasOwn(listed, 'children'), false);
+    assert.deepEqual(listed.childIds, [first.child.childId, second.child.childId]);
+    assert.deepEqual(listed.statusByChildId, {
+      [first.child.childId]: 'dry-run',
+      [second.child.childId]: 'dry-run',
+    });
+    const privateChildren = ledgerChildrenForRun(stateRoot, 'facade-list-run');
+    assert.deepEqual(privateChildren.map((child) => child.role), ['executor', 'technical-researcher']);
     const listEvent = ledgerEventsForRun(stateRoot, 'facade-list-run').find((event) => event.event === 'facade_list');
     assert.deepEqual(listEvent.childIds, [first.child.childId, second.child.childId]);
   });
@@ -1491,19 +1599,21 @@ test('stronk_subagent intercom adapter delegates through Pi subagent slash bridg
     assert.equal(waited.child.terminalResult, 'completed');
     assert.equal(waited.child.terminalResultBytes > 0, true);
     assert.match(waited.child.terminalResultSha256, /^[a-f0-9]{64}$/);
-    assert.match(waited.child.childOutputPreview, /bridge-completed/);
-    assert.equal(waited.child.terminalOutputPreview, waited.child.childOutputPreview);
+    assertNoInlineOutputPreview(waited.child);
     assert.equal(waited.child.childOutputTruncated, false);
-    assert.equal(waited.child.childOutputBytes, Buffer.byteLength(waited.child.childOutputPreview, 'utf8'));
+    assert.match(waited.child.childOutputHandle, /^subagent-output-[a-f0-9-]+$/);
     assert.match(waited.child.childOutputHash, /^[a-f0-9]{64}$/);
     assert.equal(waited.child.recommendedNextAction, 'close_child');
-    assert.equal(waited.child.timedOut, false);
-    assert.ok(!waited.child.childOutputPreview.includes(fakeSecret));
+    assert.equal(Object.hasOwn(waited.child, 'timedOut'), false);
+    const output = await readAllOutput(execute, waited.child.childOutputHandle);
+    assert.match(output.text, /bridge-completed/);
+    assert.doesNotMatch(output.text, new RegExp(fakeSecret.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')));
     const waitedAgain = parseResult(await execute({ action: 'wait', childId: spawn.child.childId, timeoutMs: 1000 }));
     assert.equal(waitedAgain.child.status, 'completed');
     const status = parseResult(await execute({ action: 'status', childId: spawn.child.childId }));
     assert.equal(status.child.status, 'completed');
-    assert.equal(status.child.childOutputPreview, waited.child.childOutputPreview);
+    assertNoInlineOutputPreview(status.child);
+    assert.equal(status.child.childOutputHandle, waited.child.childOutputHandle);
     assert.equal(status.child.childOutputHash, waited.child.childOutputHash);
     assert.equal(status.child.childOutputBytes, waited.child.childOutputBytes);
     assert.equal(status.child.childOutputTruncated, false);
@@ -1601,10 +1711,12 @@ test('stronk_subagent intercom wait classifies failed complete result before exp
     assert.equal(waited.child.isTerminal, true);
     assert.equal(waited.child.failureReason, 'upstream_success_false');
     assert.match(waited.child.errorSummary, /negative failure visible to parent/);
-    assert.match(waited.child.childOutputPreview, /negative failure visible to parent/);
-    assert.doesNotMatch(waited.child.childOutputPreview, /supersecret123/);
-    assert.doesNotMatch(waited.child.childOutputPreview, /\/Users\/example/);
-    assert.doesNotMatch(waited.child.childOutputPreview, /file:\/\/\/tmp/);
+    assertNoInlineOutputPreview(waited.child);
+    const output = await readAllOutput(execute, waited.child.childOutputHandle);
+    assert.match(output.text, /negative failure visible to parent/);
+    assert.doesNotMatch(output.text, /supersecret123/);
+    assert.doesNotMatch(output.text, /\/Users\/example/);
+    assert.doesNotMatch(output.text, /file:\/\/\/tmp/);
     assert.equal(waited.child.recommendedNextAction, 'inspect_error');
 
     const artifacts = ledgerArtifactsForRun(stateRoot, 'facade-failed-complete-run');
@@ -1654,7 +1766,9 @@ test('stronk_subagent intercom immediate response classifies failed result rows'
     assert.equal(result.child.status, 'failed');
     assert.equal(result.child.isTerminal, true);
     assert.equal(result.child.failureReason, 'upstream_result_failed');
-    assert.match(result.child.childOutputPreview, /immediate row failed output/);
+    assertNoInlineOutputPreview(result.child);
+    const output = await readAllOutput(execute, result.child.childOutputHandle);
+    assert.match(output.text, /immediate row failed output/);
     assert.equal(result.child.recommendedNextAction, 'inspect_error');
   });
 });
@@ -1712,8 +1826,7 @@ test('stronk_subagent intercom immediate 429 capacity response exposes retry met
     assert.equal(result.child.outputUsableForSynthesis, false);
     assert.equal(result.child.recommendedNextAction, 'retry_capacity_children_next_batch');
     assert.equal(result.child.childOutputHandle, null);
-    assert.equal(result.child.childOutputPreview, null);
-    assert.equal(result.child.terminalOutputPreview, null);
+    assertNoInlineOutputPreview(result.child);
     assertPublicResultPathClean(result);
     assert.doesNotMatch(JSON.stringify(result), /NeuralWatt|GLM|Concurrent limit reached|slots in use/i);
     assert.equal(capturedRequests[0].params.model, 'deepseek/deepseek-v4-pro:high');
@@ -1778,7 +1891,7 @@ test('stronk_subagent intercom async capacity failure is retryable and not reada
     assert.equal(waited.child.concurrencyInUse, 3);
     assert.equal(waited.child.concurrencyLimit, 3);
     assert.equal(waited.child.childOutputHandle, null);
-    assert.equal(waited.child.childOutputPreview, null);
+    assertNoInlineOutputPreview(waited.child);
     assert.equal(waited.child.outputUsableForSynthesis, false);
     assert.equal(waited.child.recommendedNextAction, 'retry_capacity_children_next_batch');
     assert.doesNotMatch(JSON.stringify(waited), /max concurrent requests reached|slots in use/i);
@@ -1869,7 +1982,9 @@ test('stronk_subagent intercom wait classifies independent upstream failure sign
 
         assert.equal(waited.child.status, 'failed');
         assert.equal(waited.child.failureReason, item.expected);
-        assert.match(waited.child.childOutputPreview, item.preview);
+        assertNoInlineOutputPreview(waited.child);
+        const output = await readAllOutput(execute, waited.child.childOutputHandle);
+        assert.match(output.text, item.preview);
         assert.equal(waited.child.recommendedNextAction, 'inspect_error');
       });
     }
@@ -1918,7 +2033,9 @@ test('stronk_subagent intercom wait treats positive complete output as completed
     assert.equal(waited.child.failureReason, null);
     assert.equal(waited.child.outputArtifactKind, 'findings');
     assert.equal(waited.child.outputUsableForSynthesis, true);
-    assert.match(waited.child.childOutputPreview, /revived findings delivered/);
+    assertNoInlineOutputPreview(waited.child);
+    const output = await readAllOutput(execute, waited.child.childOutputHandle);
+    assert.match(output.text, /revived findings delivered/);
   });
 });
 
@@ -1962,7 +2079,9 @@ test('stronk_subagent intercom wait does not treat completion marker as synthesi
     assert.equal(waited.child.status, 'completed');
     assert.equal(waited.child.outputArtifactKind, 'terminal-summary');
     assert.equal(waited.child.outputUsableForSynthesis, false);
-    assert.equal(waited.child.childOutputPreview, 'subagent completed');
+    assertNoInlineOutputPreview(waited.child);
+    const output = await readAllOutput(execute, waited.child.childOutputHandle);
+    assert.equal(output.text, 'subagent completed');
   });
 });
 
@@ -2107,13 +2226,19 @@ test('stronk_subagent child output preview redacts before UTF-8-safe truncation'
 
     assert.equal(waited.child.status, 'completed');
     assert.equal(waited.child.childOutputTruncated, true);
-    assert.equal(Buffer.byteLength(waited.child.childOutputPreview, 'utf8') <= 8192, true);
-    assert.doesNotMatch(waited.child.childOutputPreview, /supersecret123/);
-    assert.doesNotMatch(waited.child.childOutputPreview, /super secret with spaces/);
-    assert.doesNotMatch(waited.child.childOutputPreview, /\/Users\/example/);
-    assert.doesNotMatch(waited.child.childOutputPreview, /Application Support|My Documents|private file/);
-    assert.doesNotMatch(waited.child.childOutputPreview, /file:\/\/\/Users/);
-    assert.doesNotMatch(waited.child.childOutputPreview, /\uFFFD/);
+    assertNoInlineOutputPreview(waited.child);
+    const output = parseResult(await execute({
+      action: 'read_output',
+      outputHandle: waited.child.childOutputHandle,
+      maxChars: 512,
+    }));
+    assert.equal(Buffer.byteLength(output.output.chunk, 'utf8') <= 8192, true);
+    assert.doesNotMatch(output.output.chunk, /supersecret123/);
+    assert.doesNotMatch(output.output.chunk, /super secret with spaces/);
+    assert.doesNotMatch(output.output.chunk, /\/Users\/example/);
+    assert.doesNotMatch(output.output.chunk, /Application Support|My Documents|private file/);
+    assert.doesNotMatch(output.output.chunk, /file:\/\/\/Users/);
+    assert.doesNotMatch(output.output.chunk, /\uFFFD/);
   });
 });
 
@@ -2319,7 +2444,9 @@ test('stronk_subagent send_input refreshes upstream state before terminal barrie
     assert.equal(capturedRequests.some((request) => request.params.action === 'resume'), false);
     const status = parseResult(await execute({ action: 'status', childId: spawn.child.childId }));
     assert.equal(status.child.status, 'completed');
-    assert.match(status.child.childOutputPreview, /finished before follow-up/);
+    assertNoInlineOutputPreview(status.child);
+    const output = await readAllOutput(execute, status.child.childOutputHandle);
+    assert.match(output.text, /finished before follow-up/);
   });
 });
 

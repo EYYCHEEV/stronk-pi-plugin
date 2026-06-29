@@ -780,7 +780,7 @@ function expandHomePath(value, env = process.env) {
 }
 
 function stronkStateRoot(env = process.env) {
-  return resolve(expandHomePath(firstString(env.STRONK_PI_STATE_ROOT) || '~/.stronk-pi', env));
+  return resolve(expandHomePath(firstString(env.STRONK_PI_STATE_ROOT, env.STRONKPI_STATE_ROOT) || '~/.stronk-pi', env));
 }
 
 function normalizeFailureMode(value, fallback = DEFAULT_IMAGE_PREFLIGHT_FAILURE_MODE) {
@@ -8245,7 +8245,7 @@ function registerStronkTools(pi, state = { todos: [] }) {
         'Use wait_all for explicit current-run child IDs when coordinating batches; duplicate, invalid, unknown, or foreign child IDs are denied.',
         'Provider capacity failures expose failureClass=provider_capacity, retryable=true, and retryableCapacityChildIds; treat them as retry lifecycle state, not child findings.',
         'For provider capacity failures, wait for nextRetryAfterMs or for non-terminal batch children to drain, then retry with guarded revive; do not switch models or add fallback/provider/concurrency overrides.',
-        'Use read_output with opaque childOutputHandle values for bounded sanitized chunks; handles are invalidated by close and close_all.',
+        'Use read_output with opaque childOutputHandle values for bounded sanitized chunks; lifecycle responses do not include inline output previews, and handles remain readable after close.',
         'Use close_all for explicit batch cleanup and inspect per-child close and cleanup failure arrays.',
         'Use long waits, respect terminal barriers before synthesis, send follow-up only to non-terminal children, and close children after terminal synthesis.',
         'Check roleRequested, roleUsed, aliasResolved, timedOut, recommendedNextAction, failedChildIds, cleanupFailedChildIds, and cleanupVerified before reporting lifecycle status.',
